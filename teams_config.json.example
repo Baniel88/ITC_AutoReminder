@@ -1,0 +1,40 @@
+{
+    "enabled": true,
+    "default_webhook": "itc_notifications",
+    "webhooks": {
+        "itc_notifications": "https://pgone.webhook.office.com/webhookb2/YOUR_WEBHOOK_URL_HERE",
+        "urgent_alerts": "https://pg.webhook.office.com/webhookb2/YOUR_URGENT_WEBHOOK_URL_HERE",
+        "general_notifications": "https://pg.webhook.office.com/webhookb2/YOUR_GENERAL_WEBHOOK_URL_HERE"
+    },
+    "team_members": {
+        "itc_team": [
+            "your.email@pg.com"
+        ],
+        "site_team": [
+            "site.admin@pg.com",
+            "site.manager@pg.com"
+        ],
+        "managers": [
+            "manager1@pg.com",
+            "manager2@pg.com"
+        ]
+    },
+    "notification_rules": {
+        "urgent_issues": {
+            "webhook": "urgent_alerts",
+            "mention_team": "itc_team"
+        },
+        "normal_issues": {
+            "webhook": "itc_notifications",
+            "mention_team": null
+        },
+        "revoked_issues": {
+            "webhook": "itc_notifications",
+            "mention_team": "site_team"
+        },
+        "completion_notice": {
+            "webhook": "general_notifications",
+            "mention_team": null
+        }
+    }
+}

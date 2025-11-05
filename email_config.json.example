@@ -1,0 +1,55 @@
+{
+    "reports": {
+        "Pending review任务提醒": {
+            "recipients": [],
+            "cc": ["your.email@pg.com"],
+            "cc1": {
+                "LGDC": ["dc.contact1@pg.com"],
+                "TCDC": ["dc.contact2@pg.com"],
+                "HPDC": ["dc.contact3@pg.com"],
+                "XQDC": ["dc.contact4@pg.com"],
+                "SYDC": ["dc.contact5@pg.com"],
+                "XADC": ["dc.contact6@pg.com"],
+                "WHDC": ["dc.contact7@pg.com"],
+                "DCDC": ["dc.contact8@pg.com"],
+                "ITrade": ["itrade.contact1@pg.com", "itrade.contact2@pg.com"],
+                "PSIC": ["psic.contact@pg.com"]
+            }
+        },
+        "Revoked状态任务提醒": {
+            "recipients": [],
+            "cc": ["your.email@pg.com"],
+            "cc1": {
+                "LGDC": ["dc.contact1@pg.com"],
+                "TCDC": ["dc.contact2@pg.com"],
+                "HPDC": ["dc.contact3@pg.com"],
+                "XQDC": ["dc.contact4@pg.com"],
+                "SYDC": ["dc.contact5@pg.com"],
+                "XADC": ["dc.contact6@pg.com"],
+                "WHDC": ["dc.contact7@pg.com"],
+                "DCDC": ["dc.contact8@pg.com"],
+                "ITrade": ["itrade.contact1@pg.com", "itrade.contact2@pg.com"],
+                "PSIC": ["psic.contact@pg.com"]
+            }
+        }
+    },
+    "system_config": {
+        "EMAIL_ENABLED": true,
+        "AUTO_SEND_EMAIL": false,
+        "MAX_REMAINING_DAYS_FOR_REPORT": 19,
+        "URGENCY_LEVELS": {
+            "非常紧急": 2,
+            "紧急": 4,
+            "常规": 10
+        },
+        "ITC_REPORT_DIR_NAME": "ITC report",
+        "RAW_DATA_DIR_NAME": "RawData",
+        "REMINDER_DIR_NAME": "Reminder",
+        "LOG_DIR_NAME": "Log",
+        "EMAIL_SUBJECT_PENDING": "Pending review任务提醒",
+        "EMAIL_SUBJECT_REVOKED": "Revoked状态任务提醒",
+        "EMAIL_ExitForm_REVOKED": "ExitForm:SSO的应用/加入域的系统或者没有Onekey系统权限就无法登录系统的，可以在1年内在系统里面移除并确认，否则24小时移除；换句话说，Onekey user的权限一定要求离职通知的24小时内移除",
+        "EMAIL_RoleChange_REVOKED": "请在30天内移除并在ITC确认",
+        "ITC_SYSTEM_LINK": "https://itc-tool.pg.com/ComplianceReport?siteId=193"
+    }
+}

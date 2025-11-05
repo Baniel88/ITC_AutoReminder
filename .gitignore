@@ -48,10 +48,11 @@ Thumbs.db
 # Logs
 *.log
 
-# ITC Reports (contain sensitive data)
-ITC report/RawData/*.csv
-ITC report/Reminder/*.html
-ITC report/Reminder/*.txt
+# ITC Reports (运行时生成的报表文件)
+ITC report/
+
+# Backup files
+Backup/
 
 # Temporary files
 *.tmp
@@ -63,6 +64,6 @@ ITC report/Reminder/*.txt
 desktop.ini
 $RECYCLE.BIN/
 
-# Personal/Sensitive Config
-email_config_personal.json
-teams_config_personal.json
+# Personal/Sensitive Config (包含真实邮箱和Teams webhook)
+email_config.json
+teams_config.json

@@ -1,0 +1,23 @@
+# ITC AutoReminder 项目依赖
+
+# Web自动化
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# 数据处理
+pandas>=2.1.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# HTML解析
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Windows COM (Outlook邮件发送)
+pywin32>=306
+
+# HTTP请求
+requests>=2.31.0
+
+# 其他工具
+python-dateutil>=2.8.0
