@@ -2,7 +2,7 @@
     "enabled": true,
     "default_webhook": "itc_notifications",
     "webhooks": {
-        "itc_notifications": "https://pgone.webhook.office.com/webhookb2/b320358b-da36-47e8-9007-21fecd43e383@3596192b-fdf5-4e2c-a6fa-acb706c963d8/IncomingWebhook/ef9e46bea68647d1853d7653cb713c4c/b25908c2-19b3-42a9-b373-975bcf564b5b/V2uJRtxbhqR61xeTNhSeT5DgBSLfR1elVDS8LjQunHb5k1",
+        "itc_notifications": "https://pgone.webhook.office.com/webhookb2/b320358b-da36-47e8-9007-21fecd43e383@3596192b-fdf5-4e2c-a6fa-acb706c963d8/IncomingWebhook/12c8a632ac8f47f7b3814b1b4af0a640/b25908c2-19b3-42a9-b373-975bcf564b5b/V2PkxSjGEfEZ8rYrcLeNThHD38dFKT9mMxnSueWvdbgqw1",
         "urgent_alerts": "https://pg.webhook.office.com/webhookb2/YOUR_URGENT_WEBHOOK_URL_HERE",
         "general_notifications": "https://pg.webhook.office.com/webhookb2/YOUR_GENERAL_WEBHOOK_URL_HERE"
     },
