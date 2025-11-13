@@ -25,24 +25,42 @@ def load_email_config(config_path=None):
         return json.load(f)
 
 
-def send_email(subject, html_content, to_addrs, cc_addrs=None, config_path=None, max_retries=2, auto_send=False):
+def send_email(subject, html_content, to_addrs, cc_addrs=None, config_path=None, max_retries=2, auto_send=None):
     """
     发送邮件主函数（更新版）
-    subject: 邮件标题
-    html_content: HTML格式的邮件内容
-    to_addrs: 收件人列表（必填，如 ["a@pg.com", "b@pg.com"]）
-    cc_addrs: 抄送人列表（可选，默认空列表）
-    config_path: 配置文件路径（可选，如需其他配置可传入）
-    max_retries: 最大重试次数
-    auto_send: True=直接发送, False=打开预览窗口让用户确认后发送
+    ...
+    auto_send: True=直接发送, False=打开预览窗口, None=从config读取
     """
     # 处理默认参数
     if cc_addrs is None:
         cc_addrs = []
     
+    # ✅ 【新增】如果没有明确指定 auto_send，从配置文件读取
+    if auto_send is None:
+        try:
+            if not config_path:
+                config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email_config.json")
+            
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    system_config = config.get('system_config', {})
+                    auto_send = system_config.get('AUTO_SEND_EMAIL', False)
+                    print(f"📧 从配置读取: AUTO_SEND_EMAIL={auto_send}")
+            else:
+                auto_send = False
+                print("📧 配置文件不存在，使用默认值: auto_send=False")
+        except Exception as e:
+            print(f"⚠️ 读取配置失败: {e}，使用默认值: auto_send=False")
+            auto_send = False
+    
     # 验证收件人
     if not to_addrs:
         raise ValueError("收件人列表不能为空！")
+    
+    print(f"📧 邮件发送模式: {'自动发送' if auto_send else '预览模式'}")
+    
+
     
     retry_count = 0
     while retry_count <= max_retries:

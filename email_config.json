@@ -36,7 +36,7 @@
     "system_config": {
         "EMAIL_ENABLED": true,
         "AUTO_SEND_EMAIL": true,
-        "MAX_REMAINING_DAYS_FOR_REPORT": 19,
+        "MAX_REMAINING_DAYS_FOR_REPORT": 10,
         "URGENCY_LEVELS": {
             "非常紧急": 2,
             "紧急": 4,

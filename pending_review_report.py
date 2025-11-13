@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
             "cc": [],
             "cc1": {},  # 所有Category的匹配规则在这里配置
             "system_config": {
-                "MAX_REMAINING_DAYS_FOR_REPORT": 10,
+                "MAX_REMAINING_DAYS_FOR_REPORT": 20,
                 "URGENCY_LEVELS": {
                     "非常紧急": 2,
                     "紧急": 4,

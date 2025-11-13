@@ -37,7 +37,12 @@ import numpy as np
 import json
 from bs4 import BeautifulSoup
 import warnings
-
+import sys, io
+if sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 # -------------------------- 核心配置 --------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,9 +108,9 @@ POST_DOWNLOAD_WAIT = 10
 SCRIPT_CALL_TIMEOUT = 600
 
 # 邮件发送控制（主配置）
-EMAIL_AUTO_SEND = True  # True=直接发送, False=预览后发送（推荐）
+EMAIL_AUTO_SEND = False  # True=直接发送, False=预览后发送（推荐）
 EMAIL_ENABLED = True     # True=启用邮件功能, False=完全禁用邮件
-SEND_COMPLETION_EMAIL = False  # True=发送完成通知邮件, False=只在有问题时发送
+SEND_COMPLETION_EMAIL = True  # True=发送完成通知邮件, False=只在有问题时发送
 
 # Teams通知控制
 TEAMS_ENABLED = True     # True=启用Teams通知, False=禁用Teams通知
@@ -1248,7 +1253,8 @@ if __name__ == "__main__":
                                 html_content=html_content, 
                                 to_addrs=to_addrs, 
                                 cc_addrs=cc_addrs,
-                                auto_send=auto_send
+                                #auto_send=auto_send
+                                auto_send=EMAIL_AUTO_SEND
                             )
                             
                             if auto_send:
