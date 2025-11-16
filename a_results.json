@@ -1,0 +1,19 @@
+{
+    "pending_count": 1,
+    "revoked_count": 0,
+    "pending_review_items": [
+        {
+            "Action Owner": "gao.q",
+            "Action Owner Email": "gao.q@pg.com",
+            "System/Solution": "Local Digital Device-TC-PGLJ-SVRA(ASRS Server1)",
+            "Category": "TCDC",
+            "SiteTokens": [
+                "TCDC"
+            ],
+            "剩余天数": 10,
+            "紧急程度": "常规",
+            "Request ID": "N/A"
+        }
+    ],
+    "revoked_items": []
+}

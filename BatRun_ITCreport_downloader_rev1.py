@@ -108,13 +108,13 @@ POST_DOWNLOAD_WAIT = 10
 SCRIPT_CALL_TIMEOUT = 600
 
 # 邮件发送控制（主配置）
-EMAIL_AUTO_SEND = False  # True=直接发送, False=预览后发送（推荐）
+EMAIL_AUTO_SEND = True  # True=直接发送, False=预览后发送（推荐）
 EMAIL_ENABLED = True     # True=启用邮件功能, False=完全禁用邮件
-SEND_COMPLETION_EMAIL = True  # True=发送完成通知邮件, False=只在有问题时发送
+SEND_COMPLETION_EMAIL = False  # True=发送完成通知邮件, False=只在有问题时发送
 
 # Teams通知控制
-TEAMS_ENABLED = True     # True=启用Teams通知, False=禁用Teams通知
-TEAMS_SEND_COMPLETION = True  # True=发送完成通知到Teams, False=只在有问题时发送
+TEAMS_ENABLED = False     # True=启用Teams通知, False=禁用Teams通知
+TEAMS_SEND_COMPLETION = False  # True=发送完成通知到Teams, False=只在有问题时发送
 
 # Chrome窗口管理
 REUSE_EXISTING_CHROME = True   # True=重用已打开的Chrome窗口, False=总是打开新窗口
@@ -1254,7 +1254,7 @@ if __name__ == "__main__":
                                 to_addrs=to_addrs, 
                                 cc_addrs=cc_addrs,
                                 #auto_send=auto_send
-                                auto_send=EMAIL_AUTO_SEND
+                                #auto_send=EMAIL_AUTO_SEND
                             )
                             
                             if auto_send:
@@ -1316,18 +1316,50 @@ if __name__ == "__main__":
         if CLOSE_CHROME_ON_EXIT:
             # 尝试关闭Chrome
             try:
-                import psutil
-                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                    if proc.info['name'] == 'chrome.exe' and proc.info['cmdline']:
-                        for arg in proc.info['cmdline']:
-                            if f'remote-debugging-port={DEBUG_PORT}' in arg:
-                                proc.terminate()
-                                chrome_status_msg = f"🔚 已关闭Chrome调试会话 (端口: {DEBUG_PORT})"
-                                break
-                if not chrome_status_msg:
-                    chrome_status_msg = f"ℹ️ 未找到需要关闭的Chrome进程 (端口: {DEBUG_PORT})"
-            except ImportError:
-                chrome_status_msg = f"⚠️ 无法自动关闭Chrome (需要安装psutil库)，请手动关闭端口{DEBUG_PORT}的Chrome窗口"
+                # 尝试导入psutil（可选依赖）
+                try:
+                    import psutil
+                    psutil_available = True
+                except ImportError:
+                    psutil_available = False
+                
+                if psutil_available:
+                    # 使用psutil关闭Chrome进程
+                    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                        if proc.info['name'] == 'chrome.exe' and proc.info['cmdline']:
+                            for arg in proc.info['cmdline']:
+                                if f'remote-debugging-port={DEBUG_PORT}' in arg:
+                                    proc.terminate()
+                                    chrome_status_msg = f"🔚 已关闭Chrome调试会话 (端口: {DEBUG_PORT})"
+                                    break
+                    if not chrome_status_msg:
+                        chrome_status_msg = f"ℹ️ 未找到需要关闭的Chrome进程 (端口: {DEBUG_PORT})"
+                else:
+                    # 备用方案：使用系统命令关闭Chrome
+                    if platform.system() == "Windows":
+                        # Windows系统使用taskkill命令
+                        try:
+                            result = subprocess.run(
+                                ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV'],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if 'chrome.exe' in result.stdout:
+                                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], timeout=10)
+                                chrome_status_msg = f"🔚 已尝试关闭Chrome进程 (端口: {DEBUG_PORT})"
+                            else:
+                                chrome_status_msg = f"ℹ️ 未找到Chrome进程 (端口: {DEBUG_PORT})"
+                        except subprocess.TimeoutExpired:
+                            chrome_status_msg = f"⚠️ 关闭Chrome进程超时 (端口: {DEBUG_PORT})"
+                        except Exception as e:
+                            chrome_status_msg = f"⚠️ 关闭Chrome进程失败: {str(e)}"
+                    else:
+                        # Linux/Mac系统使用pkill命令
+                        try:
+                            subprocess.run(['pkill', '-f', f'remote-debugging-port={DEBUG_PORT}'], timeout=10)
+                            chrome_status_msg = f"🔚 已尝试关闭Chrome调试会话 (端口: {DEBUG_PORT})"
+                        except Exception as e:
+                            chrome_status_msg = f"⚠️ 关闭Chrome进程失败: {str(e)}"
+                            
             except Exception as e:
                 chrome_status_msg = f"⚠️ 关闭Chrome时出错: {str(e)}"
         else:

@@ -1,1147 +1,929 @@
 # -*- coding: utf-8 -*-
 """
-处理待审核请求数据并生成邮件内容（包含Revoked状态说明文本）
-保存HTML和TXT格式的邮件内容到指定文件夹
-支持多报表类型和Teams通知，所有Category通过配置文件统一匹配
+Pending / Revoked 报表处理、邮件生成与 Teams 通知
+包含:
+- CSV 读取(自动编码尝试)
+- Pending/Revoked 分析与聚合
+- 高视觉邮件模板(徽章/统计卡片)
+- Teams 发送(卡片 + fallback 简单文本)
+- JSON 结果输出 (处理 numpy / datetime)
 """
 
+import os, sys, json, re, argparse, traceback, requests
 import pandas as pd
 import numpy as np
-import sys, os
-import json
-import requests
 from datetime import datetime, date
-import re
+import faulthandler
+faulthandler.enable()
+os.environ.setdefault("PANDAS_ARROW_DISABLED", "1")
 
-import warnings
-warnings.filterwarnings('ignore')
-
-# 默认配置 - 当配置文件不存在或某些配置缺失时使用
 DEFAULT_CONFIG = {
     "reports": {
         "Pending review任务提醒": {
             "recipients": [],
             "cc": [],
-            "cc1": {},  # 所有Category的匹配规则在这里配置
+            "cc1": {},
             "system_config": {
                 "MAX_REMAINING_DAYS_FOR_REPORT": 10,
-                "URGENCY_LEVELS": {
-                    "非常紧急": 2,
-                    "紧急": 4,
-                    "常规": 10
-                },
+                "URGENCY_LEVELS": {"非常紧急": 2, "紧急": 4, "常规": 10},
                 "ITC_REPORT_DIR_NAME": "ITC report",
                 "RAW_DATA_DIR_NAME": "RawData",
                 "REMINDER_DIR_NAME": "Reminder",
                 "LOG_DIR_NAME": "Log",
                 "EMAIL_SUBJECT_PENDING": "Pending review任务提醒",
                 "EMAIL_SUBJECT_REVOKED": "Revoked状态任务提醒",
-                "EMAIL_ExitForm_REVOKED": "SSO的应用/加入域的系统，可以在1年内在系统里面移除并确认,否则24小时移除",
-                "EMAIL_RoleChange_REVOKED": "请尽快和user联系，尽快处理，在30天内在ITC确认",
+                "EMAIL_ExitForm_REVOKED": "ExitForm:SSO的应用/加入域的系统或者没有Onekey系统权限就无法登录系统的，可以在1年内在系统里面移除并确认，否则24小时移除；换句话说，Onekey user的权限一定要求离职通知的24小时内移除",
+                "EMAIL_RoleChange_REVOKED": "请在30天内移除并在ITC确认",
                 "ITC_SYSTEM_LINK": "https://itc-tool.pg.com/ComplianceReport?siteId=193"
             }
         },
-        "Revoked状态任务提醒": {
-            "recipients": [],
-            "cc": [],
-            "cc1": {}  # 所有Category的匹配规则在这里配置
-        }
-        # 注释：已移除EVP Compliance相关配置（无此类型数据）
-        # "EVP Compliance 情况和任务提醒": {
-        #     "recipients": [],
-        #     "cc": []
-        # }
+        "Revoked状态任务提醒": {"recipients": [], "cc": [], "cc1": {}}
     },
-    "Teams": {
-        "webhook_url": "https://teams.microsoft.com/l/channel/19%3AcIJ0wUDE2YQPxiX78Gd2PNeT2r2tPtte9Bc90hoMz_k1%40thread.tacv2/General?groupId=b320358b-da36-47e8-9007-21fecd43e383&tenantId=3596192b-fdf5-4e2c-a6fa-acb706c963d8"
-    }
+    "Teams": {"webhook_url": ""}
 }
 
-
-def load_config(config_path=None):
-    """加载配置文件，如果文件不存在则创建默认配置文件"""
-    if not config_path:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(current_dir, "email_config.json")
-    
-    if not os.path.exists(config_path):
-        print(f"配置文件不存在，将在 {config_path} 创建默认配置文件")
-        with open(config_path, 'w', encoding='utf-8') as f:
+def load_config(path=None):
+    if not path:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email_config.json")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
         return DEFAULT_CONFIG.copy()
-    
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            user_config = json.load(f)
-        
-        config = DEFAULT_CONFIG.copy()
-        
-        # 加载所有报表配置
-        if "reports" in user_config:
-            for report_name, report_config in user_config["reports"].items():
-                if report_name not in config["reports"]:
-                    config["reports"][report_name] = {"recipients": [], "cc": [], "cc1": {}}
-                
-                if "recipients" in report_config:
-                    config["reports"][report_name]["recipients"] = report_config["recipients"]
-                
-                if "cc" in report_config:
-                    config["reports"][report_name]["cc"] = report_config["cc"]
-                
-                if "cc1" in report_config:
-                    config["reports"][report_name]["cc1"] = report_config["cc1"]  # 读取所有Category的匹配规则
-                
-                if "system_config" in report_config:
-                    if "system_config" not in config["reports"][report_name]:
-                        config["reports"][report_name]["system_config"] = {}
-                    for key, value in report_config["system_config"].items():
-                        config["reports"][report_name]["system_config"][key] = value
-        
-        # 提取系统配置到顶层（保持兼容性）
-        pending_system_config = config["reports"].get("Pending review任务提醒", {}).get("system_config", {})
-        for key, value in pending_system_config.items():
-            config[key] = value
-        
-        # 加载Teams配置
-        if "Teams" in user_config:
-            config["Teams"] = user_config["Teams"]
-        
-        # 确保必要配置存在
-        required_system_configs = [
-            "MAX_REMAINING_DAYS_FOR_REPORT", "URGENCY_LEVELS",
-            "ITC_REPORT_DIR_NAME", "RAW_DATA_DIR_NAME",
-            "REMINDER_DIR_NAME", "LOG_DIR_NAME",
-            "EMAIL_SUBJECT_PENDING", "EMAIL_SUBJECT_REVOKED",
-            "EMAIL_ExitForm_REVOKED", "EMAIL_RoleChange_REVOKED",
-            "ITC_SYSTEM_LINK"
-        ]
-        
-        for config_key in required_system_configs:
-            if config_key not in config:
-                print(f"警告：配置中缺少'{config_key}'，将使用默认值")
-                config[config_key] = DEFAULT_CONFIG["reports"]["Pending review任务提醒"]["system_config"][config_key]
-        
-        # 确保紧急程度配置完整
-        for level in ['非常紧急', '紧急', '常规']:
-            if level not in config['URGENCY_LEVELS']:
-                print(f"警告：配置文件中缺少'{level}'的紧急程度配置，将使用默认值")
-                config['URGENCY_LEVELS'][level] = DEFAULT_CONFIG["reports"]["Pending review任务提醒"]["system_config"]["URGENCY_LEVELS"][level]
-        
-        return config
-    except Exception as e:
-        print(f"读取配置文件出错: {str(e)}，将使用默认配置")
+        with open(path, "r", encoding="utf-8") as f:
+            user = json.load(f)
+        cfg = DEFAULT_CONFIG.copy()
+        if "reports" in user:
+            for k, v in user["reports"].items():
+                if k not in cfg["reports"]:
+                    cfg["reports"][k] = {
+                        "recipients": [], "cc": [], "cc1": {},
+                        "system_config": DEFAULT_CONFIG["reports"]["Pending review任务提醒"]["system_config"].copy()
+                    }
+                for field in ["recipients", "cc", "cc1", "system_config"]:
+                    if field in v:
+                        cfg["reports"][k][field] = v[field]
+        if "Teams" in user:
+            cfg["Teams"] = user["Teams"]
+        base_levels = DEFAULT_CONFIG["reports"]["Pending review任务提醒"]["system_config"]["URGENCY_LEVELS"]
+        for lvl, val in base_levels.items():
+            if lvl not in cfg["reports"]["Pending review任务提醒"]["system_config"]["URGENCY_LEVELS"]:
+                cfg["reports"]["Pending review任务提醒"]["system_config"]["URGENCY_LEVELS"][lvl] = val
+        return cfg
+    except Exception:
         return DEFAULT_CONFIG.copy()
 
-
-# 加载配置
 CONFIG = load_config()
+_SYS = CONFIG["reports"]["Pending review任务提醒"]["system_config"]
 
-
-# 辅助函数：确保目录存在
-def ensure_directory_exists(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-        print(f"已创建文件夹: {directory}")
-    return directory
-
-
-# 辅助函数：确保邮箱地址包含@pg.com后缀
-def ensure_pg_email(email, username=None):
-    if pd.isna(email) or email.strip() == '':
-        if username and username.strip() != '':
-            return f"{username.strip().lower().replace(' ', '.')}@pg.com"
-        return ''
-    
-    email = email.strip()
-    if '@' not in email:
-        return f"{email.lower()}@pg.com"
-    elif not email.endswith('@pg.com'):
-        local_part = email.split('@')[0]
-        return f"{local_part}@pg.com"
-    return email
-
-
-# 通用的cc1邮箱匹配函数（所有Category统一逻辑）
-def get_matching_cc1_emails(category, report_type, strict_match=False):
-    """
-    根据分类(Category)和报表类型获取匹配的cc1邮箱列表
-    匹配规则完全由email_config.json中的cc1配置决定
-    """
-    report_config = CONFIG["reports"].get(report_type, {})
-    if "cc1" not in report_config:
-        print(f"调试：{report_type} 未配置cc1，Category={category}")
-        return []
-    
-    cc1_config = report_config["cc1"]
-    category_clean = str(category).strip() if pd.notna(category) else ""
-    
-    # 1. 优先精确匹配配置中的key
-    if category_clean in cc1_config:
-        matched_emails = [ensure_pg_email(email) for email in cc1_config[category_clean]]
-        print(f"调试：Category={category_clean} 精确匹配到cc1邮箱: {matched_emails}")
-        return matched_emails
-    
-    # 2. 非严格模式下进行模糊匹配（所有Category统一逻辑）
-    if not strict_match:
-        for key in cc1_config:
-            key_clean = str(key).strip()
-            if (key_clean.lower() in category_clean.lower()) or (category_clean.lower() in key_clean.lower()):
-                matched_emails = [ensure_pg_email(email) for email in cc1_config[key]]
-                print(f"调试：Category={category_clean} 模糊匹配到cc1键={key_clean}，邮箱: {matched_emails}")
-                return matched_emails
-    
-    print(f"调试：Category={category_clean} 未匹配到cc1邮箱")
-    return []
-
-
-# 辅助函数：安全解析日期列
-def safe_parse_dates(df, date_columns):
-    for col in date_columns:
-        if col in df.columns:
-            df[col] = pd.to_datetime(
-                df[col], 
-                errors='coerce'
-            )
-    return df
-
-
-# 数据读取与处理
-def load_and_process_data(csv_file_path):
-    df = pd.read_csv(
-        csv_file_path,
-        na_values=['', ' ', 'NA'],
-        keep_default_na=True
+def get_cfg(key):
+    return CONFIG["reports"]["Pending review任务提醒"]["system_config"].get(
+        key,
+        DEFAULT_CONFIG["reports"]["Pending review任务提醒"]["system_config"].get(key)
     )
 
-    df = df.replace(r'^\s*$', np.nan, regex=True)
-    
-    date_columns = ['Requested Date', 'Expiration Date', 'Log Date']
-    df = safe_parse_dates(df, date_columns)
-
-    for col in date_columns:
-        if col in df.columns:
-            na_count = df[col].isna().sum()
-            if na_count > 0:
-                print(f"警告：{col}列中有 {na_count} 个值无法解析为日期")
-
-    df['is_new_request'] = df['Requester'].notna().astype(int)
-    df['request_group'] = df['is_new_request'].cumsum()
-
-    columns_to_fill = [
-        'Requester', 'Requester Email', 'Request For', 'Request For Email', 
-        'Requested Date', 'Area', 'Category', 'Category Description',
-        'System/Solution', 'System/Solution Description', 'Approval Text',
-        'Owner Guidelines', 'Expiration Date', 'Max Request Age (Days)',
-        'Access Type', 'Temporary Access?', 'Privileged?', 'Status',
-        'Confirmed?', 'Reason', 'Remark/Role', 'Employee Status',
-        'Log Actor', 'Log Status', 'Log Date'
-    ]
-
-    for col in columns_to_fill:
-        if col in df.columns:
-            df[col] = df.groupby('request_group')[col].transform(
-                lambda x: x.ffill().bfill()
-            )
-        
-    return df
-
-
-# 分析不同类型的请求
-def analyze_requests(df):
-    required_columns = ['Status', 'System/Solution', 'Request For', 'Category']
-    for col in required_columns:
-        if col not in df.columns:
-            raise ValueError(f"数据中缺少必要的列：{col}")
-    
-    if 'Expiration Date' not in df.columns:
-        print("警告：数据中没有'Expiration Date'列，将使用默认值")
-
-    # 1. 处理Pending Review状态
-    pending_df = df[
-        (df['Status'] == 'Pending Review') &
-        (df['System/Solution'].notna()) &
-        (df['Request For'].notna()) &
-        (df['Category'].notna())
-    ].copy()
-    
-    # 2. 处理包含Revoked关键词的状态
-    revoked_df = df[
-        (df['Status'].str.contains('Revoked', case=False, na=False)) &
-        (df['System/Solution'].notna()) &
-        (df['Request For'].notna()) &
-        (df['Category'].notna())
-    ].copy()
-
-    # 注释：已移除EVP Compliance数据筛选（无此类型数据）
-    # 3. 处理EVP Compliance相关请求
-    # evp_df = df[
-    #     (df['Category'].str.contains('EVP Compliance', case=False, na=False)) &
-    #     (df['System/Solution'].notna()) &
-    #     (df['Request For'].notna())
-    # ].copy()
-
-    current_date = date.today()
-    
-    # 处理各类数据
-    pending_results = process_pending_requests(pending_df, current_date)
-    revoked_results = process_revoked_requests(revoked_df, current_date)
-    # 注释：已移除EVP Compliance数据处理（无此类型数据）
-    # evp_results = process_evp_compliance_requests(evp_df, current_date)
-    
+def cfg_values():
     return {
-        'pending': pending_results,
-        'revoked': revoked_results
-        # 注释：已移除EVP Compliance结果返回（无此类型数据）
-        # 'evp_compliance': evp_results
+        "MAX_REMAINING_DAYS_FOR_REPORT": get_cfg("MAX_REMAINING_DAYS_FOR_REPORT"),
+        "URGENCY_LEVELS": get_cfg("URGENCY_LEVELS"),
+        "EMAIL_SUBJECT_PENDING": get_cfg("EMAIL_SUBJECT_PENDING"),
+        "EMAIL_SUBJECT_REVOKED": get_cfg("EMAIL_SUBJECT_REVOKED"),
+        "ITC_SYSTEM_LINK": get_cfg("ITC_SYSTEM_LINK"),
+        "EMAIL_ExitForm_REVOKED": get_cfg("EMAIL_ExitForm_REVOKED"),
+        "EMAIL_RoleChange_REVOKED": get_cfg("EMAIL_RoleChange_REVOKED"),
     }
 
+def ensure_directory_exists(p):
+    if not os.path.exists(p):
+        os.makedirs(p, exist_ok=True)
+    return p
 
-def process_pending_requests(pending_df, current_date):
-    """处理待审核请求"""
-    report_type = "Pending review任务提醒"
-    
-    if pending_df.empty:
-        print("信息：没有待审核的请求数据")
-        empty_df = pd.DataFrame(columns=[
-            'Action Owner', 'Action Owner Email', 'System Name', 'Category',
-            '剩余天数', '紧急程度', 'Pending_review数量'
-        ])
-        return {
-            'table': empty_df,
-            'total_count': 0,
-            'recipients': CONFIG["reports"][report_type].get('recipients', []),
-            'cc': CONFIG["reports"][report_type].get('cc', []),
-            'type': report_type
-        }
-    
-    if 'Expiration Date' in pending_df.columns:
-        pending_df['expiration_date_only'] = pending_df['Expiration Date'].dt.date
-    else:
-        pending_df['expiration_date_only'] = pd.NaT
-
-    # 计算剩余天数
-    def calculate_remaining_days(row):
-        if pd.notna(row['expiration_date_only']):
-            return max((row['expiration_date_only'] - current_date).days, 0)
-        return CONFIG["MAX_REMAINING_DAYS_FOR_REPORT"]
-
-    pending_df['剩余天数'] = pending_df.apply(calculate_remaining_days, axis=1).astype(int)
-    
-    # 应用邮件发送阈值
-    filtered_df = pending_df[pending_df['剩余天数'] <= CONFIG["MAX_REMAINING_DAYS_FOR_REPORT"]].copy()
-    excluded_count = len(pending_df) - len(filtered_df)
-    if excluded_count > 0:
-        print(f"根据配置，已排除 {excluded_count} 条剩余天数超过 {CONFIG['MAX_REMAINING_DAYS_FOR_REPORT']} 天的Pending请求")
-    
-    if filtered_df.empty:
-        print(f"信息：没有剩余天数小于等于 {CONFIG['MAX_REMAINING_DAYS_FOR_REPORT']} 天的待审核请求")
-        empty_df = pd.DataFrame(columns=[
-            'Action Owner', 'Action Owner Email', 'System Name', 'Category',
-            '剩余天数', '紧急程度', 'Pending_review数量'
-        ])
-        return {
-            'table': empty_df,
-            'total_count': 0,
-            'recipients': CONFIG["reports"][report_type].get('recipients', []),
-            'cc': CONFIG["reports"][report_type].get('cc', []),
-            'type': report_type
-        }
-
-    # 标记紧急程度
-    def mark_urgency(days):
-        if days <= CONFIG['URGENCY_LEVELS']['非常紧急']:
-            return '非常紧急'
-        elif days <= CONFIG['URGENCY_LEVELS']['紧急']:
-            return '紧急'
-        elif days <= CONFIG['URGENCY_LEVELS']['常规']:
-            return '常规'
-        return '常规'
-
-    filtered_df['紧急程度'] = filtered_df['剩余天数'].apply(mark_urgency)
-
-    # 获取负责人和邮箱
-    def get_action_owner_and_email(group):
-        try:
-            approval_statuses = ['Approved', 'PartiallyApproved']
-            if 'Log Status' in group.columns:
-                approval_records = group[group['Log Status'].isin(approval_statuses)]
-            else:
-                approval_records = pd.DataFrame()
-            
-            if not approval_records.empty and 'Log Date' in approval_records.columns:
-                latest_approval = approval_records.loc[approval_records['Log Date'].idxmax()]
-                email = ensure_pg_email(
-                    latest_approval.get('Log Actor Email', ''),
-                    latest_approval.get('Log Actor', '')
-                )
-                return pd.Series({
-                    'Action Owner': latest_approval.get('Log Actor', '未知负责人'),
-                    'Action Owner Email': email
-                })
-            else:
-                requester = group['Requester'].iloc[0] if 'Requester' in group.columns and pd.notna(group['Requester'].iloc[0]) else '未知请求者'
-                requester_email = group['Requester Email'].iloc[0] if 'Requester Email' in group.columns and pd.notna(group['Requester Email'].iloc[0]) else ''
-                email = ensure_pg_email(requester_email, requester)
-                return pd.Series({
-                    'Action Owner': requester,
-                    'Action Owner Email': email
-                })
-        except Exception as e:
-            print(f"提取负责人信息时出错: {str(e)}")
-            return pd.Series({
-                'Action Owner': '提取失败',
-                'Action Owner Email': ''
-            })
-
+def log_message(msg, log_dir):
+    ensure_directory_exists(log_dir)
+    lf = os.path.join(log_dir, f"process_{datetime.now().strftime('%Y%m%d')}.log")
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
-        grouped = filtered_df.groupby('request_group')
-        owner_info = grouped.apply(
-            lambda x: pd.Series({
-                'Action Owner': get_action_owner_and_email(x)['Action Owner'],
-                'Action Owner Email': get_action_owner_and_email(x)['Action Owner Email'],
-                'System/Solution': x['System/Solution'].iloc[0] if pd.notna(x['System/Solution'].iloc[0]) else '未知系统',
-                'Category': x['Category'].iloc[0] if pd.notna(x['Category'].iloc[0]) else '未知分类',
-                '剩余天数': x['剩余天数'].iloc[0],
-                '紧急程度': x['紧急程度'].iloc[0]
-            })
-        ).reset_index(drop=True)
-        
-        for col in ['Action Owner', 'Action Owner Email', 'System/Solution', 'Category', '剩余天数', '紧急程度']:
-            if col not in owner_info.columns:
-                owner_info[col] = '未知' if col != '剩余天数' else 0
-                
-    except Exception as e:
-        print(f"分组处理时出错: {str(e)}")
-        owner_info = pd.DataFrame({
-            'Action Owner': ['处理错误'],
-            'Action Owner Email': [''],
-            'System/Solution': ['未知系统'],
-            'Category': ['未知分类'],
-            '剩余天数': [0],
-            '紧急程度': ['常规']
-        })
+        print(line, flush=True)
+    except (UnicodeEncodeError, ValueError):
+        try:
+            sys.stdout.buffer.write((line + "\n").encode("utf-8", "ignore"))
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
+    try:
+        with open(lf, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
-    target_table = owner_info.groupby(
-        ['Action Owner', 'Action Owner Email', 'System/Solution', 'Category', '剩余天数', '紧急程度']
-    ).size().reset_index(name='Pending_review数量')
-
-    target_table.rename(columns={'System/Solution': 'System Name'}, inplace=True)
-
-    target_table['Action Owner'] = target_table['Action Owner'].fillna('未知负责人')
-    target_table['Action Owner Email'] = target_table['Action Owner Email'].fillna('')
-    target_table['System Name'] = target_table['System Name'].fillna('未知系统')
-    target_table['Category'] = target_table['Category'].fillna('未知分类')
-
-    total_count = target_table['Pending_review数量'].sum()
-    total_row = pd.DataFrame([{
-        'Action Owner': '总计',
-        'Action Owner Email': '',
-        'System Name': '',
-        'Category': '',
-        '剩余天数': '',
-        '紧急程度': '',
-        'Pending_review数量': total_count
-    }])
-    target_table = pd.concat([target_table, total_row], ignore_index=True)
-
-    # 获取收件人和抄送（所有Category统一匹配逻辑）
-    config_recipients = CONFIG["reports"][report_type].get("recipients", [])
-    config_cc = CONFIG["reports"][report_type].get("cc", [])
-    data_recipients = target_table[target_table['Action Owner Email'] != '']['Action Owner Email'].drop_duplicates().tolist()
-    categories = target_table[target_table['Category'] != '']['Category'].drop_duplicates().tolist()
-    cc1_emails = []
-    
-    # 所有Category使用统一匹配规则（由email_config.json中的cc1决定）
-    for category in categories:
-        # 严格匹配模式可通过配置控制，这里默认关闭（如需开启可改为True）
-        cc1_for_category = get_matching_cc1_emails(category, report_type, strict_match=False)
-        cc1_emails.extend(cc1_for_category)
-    
-    valid_recipients = list(set([ensure_pg_email(email) for email in config_recipients + data_recipients if email.strip()]))
-    valid_cc = list(set([ensure_pg_email(email) for email in config_cc + cc1_emails if email.strip()]))
-    valid_recipients = [email for email in valid_recipients if email]
-    valid_cc = [email for email in valid_cc if email]
-    
-    # 输出调试信息（所有Category统一日志格式）
-    print(f"调试：{report_type} 最终收件人: {valid_recipients}")
-    print(f"调试：{report_type} 最终抄送: {valid_cc}")
-    
-    return {
-        'table': target_table,
-        'total_count': total_count,
-        'recipients': valid_recipients,
-        'cc': valid_cc,
-        'type': report_type
-    }
-
-
-def process_revoked_requests(revoked_df, current_date):
-    """处理Revoked状态请求"""
-    report_type = "Revoked状态任务提醒"
-    
-    if revoked_df.empty:
-        print("信息：没有包含Revoked关键词的请求数据")
-        empty_df = pd.DataFrame(columns=[
-            'Action Owner', 'Action Owner Email', 'System Name', 'Category',
-            '状态', 'Revoked数量', '状态说明'
-        ])
-        return {
-            'table': empty_df,
-            'total_count': 0,
-            'recipients': CONFIG["reports"][report_type].get('recipients', []),
-            'cc': CONFIG["reports"][report_type].get('cc', []),
-            'type': report_type
-        }
-    
-    # 输出明确的数量信息便于主程序解析
-    print(f"信息：发现 {len(revoked_df)} 条Revoked请求")
-    
-    if 'Log Date' in revoked_df.columns:
-        if not pd.api.types.is_datetime64_any_dtype(revoked_df['Log Date']):
-            revoked_df['Log Date'] = pd.to_datetime(
-                revoked_df['Log Date'], 
-                errors='coerce'
-            )
-    
-    # 根据Status添加状态说明
-    def get_status_note(status):
-        if pd.isna(status):
-            return ""
-        status_lower = str(status).lower()
-        if 'exitform' in status_lower:
-            return CONFIG["EMAIL_ExitForm_REVOKED"]
-        elif 'rolechange' in status_lower:
-            return CONFIG["EMAIL_RoleChange_REVOKED"]
+def ensure_pg_email(email, username=None):
+    if pd.isna(email) or str(email).strip() == "":
+        if username:
+            return f"{username.strip().lower().replace(' ', '.')}@pg.com"
         return ""
-    
-    revoked_df['状态说明'] = revoked_df['Status'].apply(get_status_note)
-    
-    # 获取负责人和邮箱
-    def get_confirmed_actor_and_email(group):
-        try:
-            if 'Log Status' in group.columns:
-                confirmed_records = group[group['Log Status'].str.contains('confirmed', case=False, na=False)]
-            else:
-                confirmed_records = pd.DataFrame()
-            
-            if not confirmed_records.empty and 'Log Date' in confirmed_records.columns:
-                latest_confirmed = confirmed_records.loc[confirmed_records['Log Date'].idxmax()]
-                email = ensure_pg_email(
-                    latest_confirmed.get('Log Actor Email', ''),
-                    latest_confirmed.get('Log Actor', '')
-                )
-                return pd.Series({
-                    'Action Owner': latest_confirmed.get('Log Actor', '未知负责人'),
-                    'Action Owner Email': email
-                })
-            else:
-                if 'Log Date' in group.columns and not group['Log Date'].isna().all():
-                    latest_log = group.loc[group['Log Date'].idxmax()]
-                    email = ensure_pg_email(
-                        latest_log.get('Log Actor Email', ''),
-                        latest_log.get('Log Actor', '')
-                    )
-                    return pd.Series({
-                        'Action Owner': latest_log.get('Log Actor', '未知负责人'),
-                        'Action Owner Email': email
-                    })
-                else:
-                    requester = group['Requester'].iloc[0] if 'Requester' in group.columns and pd.notna(group['Requester'].iloc[0]) else '未知请求者'
-                    requester_email = group['Requester Email'].iloc[0] if 'Requester Email' in group.columns and pd.notna(group['Requester Email'].iloc[0]) else ''
-                    email = ensure_pg_email(requester_email, requester)
-                    return pd.Series({
-                        'Action Owner': requester,
-                        'Action Owner Email': email
-                    })
-        except Exception as e:
-            print(f"提取Revoked负责人信息时出错: {str(e)}")
-            return pd.Series({
-                'Action Owner': '提取失败',
-                'Action Owner Email': ''
-            })
+    email = str(email).strip()
+    if '@' not in email:
+        return f"{email.lower()}@pg.com"
+    if not email.lower().endswith("@pg.com"):
+        return email.split("@")[0] + "@pg.com"
+    return email
 
-    try:
-        grouped = revoked_df.groupby('request_group')
-        owner_info = grouped.apply(
-            lambda x: pd.Series({
-                'Action Owner': get_confirmed_actor_and_email(x)['Action Owner'],
-                'Action Owner Email': get_confirmed_actor_and_email(x)['Action Owner Email'],
-                'System/Solution': x['System/Solution'].iloc[0] if pd.notna(x['System/Solution'].iloc[0]) else '未知系统',
-                'Category': x['Category'].iloc[0] if pd.notna(x['Category'].iloc[0]) else '未知分类',
-                'Status': x['Status'].iloc[0] if pd.notna(x['Status'].iloc[0]) else 'Revoked',
-                '状态说明': x['状态说明'].iloc[0] if pd.notna(x['状态说明'].iloc[0]) else ''
-            })
-        ).reset_index(drop=True)
-        
-        for col in ['Action Owner', 'Action Owner Email', 'System/Solution', 'Category', 'Status', '状态说明']:
-            if col not in owner_info.columns:
-                owner_info[col] = '未知' if col != '状态说明' else ''
-                
-    except Exception as e:
-        print(f"Revoked分组处理时出错: {str(e)}")
-        owner_info = pd.DataFrame({
-            'Action Owner': ['处理错误'],
-            'Action Owner Email': [''],
-            'System/Solution': ['未知系统'],
-            'Category': ['未知分类'],
-            'Status': 'Revoked',
-            '状态说明': ''
-        })
+def make_json_safe(obj):
+    import numpy as _np
+    from datetime import datetime as _dt, date as _date
+    if isinstance(obj, (_np.integer,)): return int(obj)
+    if isinstance(obj, (_np.floating,)): return float(obj)
+    if isinstance(obj, (_dt, _date)): return obj.isoformat()
+    if isinstance(obj, dict): return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)): return [make_json_safe(v) for v in obj]
+    return obj
 
-    target_table = owner_info.groupby(
-        ['Action Owner', 'Action Owner Email', 'System/Solution', 'Category', 'Status', '状态说明']
-    ).size().reset_index(name='Revoked数量')
-
-    target_table.rename(columns={'System/Solution': 'System Name'}, inplace=True)
-
-    target_table['Action Owner'] = target_table['Action Owner'].fillna('未知负责人')
-    target_table['Action Owner Email'] = target_table['Action Owner Email'].fillna('')
-    target_table['System Name'] = target_table['System Name'].fillna('未知系统')
-    target_table['Category'] = target_table['Category'].fillna('未知分类')
-    target_table['状态说明'] = target_table['状态说明'].fillna('')
-
-    total_count = target_table['Revoked数量'].sum()
-    
-    # 输出明确的统计结果便于主程序解析
-    print(f"信息：统计完毕，发现 {total_count} 条Revoked请求")
-    
-    total_row = pd.DataFrame([{
-        'Action Owner': '总计',
-        'Action Owner Email': '',
-        'System Name': '',
-        'Category': '',
-        'Status': '',
-        '状态说明': '',
-        'Revoked数量': total_count
-    }])
-    target_table = pd.concat([target_table, total_row], ignore_index=True)
-
-    # 获取收件人和抄送（所有Category统一匹配逻辑）
-    config_recipients = CONFIG["reports"][report_type].get("recipients", [])
-    config_cc = CONFIG["reports"][report_type].get("cc", [])
-    data_recipients = target_table[target_table['Action Owner Email'] != '']['Action Owner Email'].drop_duplicates().tolist()
-    categories = target_table[target_table['Category'] != '']['Category'].drop_duplicates().tolist()
-    cc1_emails = []
-    
-    # 所有Category使用统一匹配规则（由email_config.json中的cc1决定）
-    for category in categories:
-        # 严格匹配模式可通过配置控制，这里默认关闭
-        cc1_for_category = get_matching_cc1_emails(category, report_type, strict_match=False)
-        cc1_emails.extend(cc1_for_category)
-    
-    valid_recipients = list(set([ensure_pg_email(email) for email in config_recipients + data_recipients if email.strip()]))
-    valid_cc = list(set([ensure_pg_email(email) for email in config_cc + cc1_emails if email.strip()]))
-    valid_recipients = [email for email in valid_recipients if email]
-    valid_cc = [email for email in valid_cc if email]
-    
-    # 输出调试信息（所有Category统一日志格式）
-    print(f"调试：{report_type} 最终收件人: {valid_recipients}")
-    print(f"调试：{report_type} 最终抄送: {valid_cc}")
-    
-    # 收集revoked请求中涉及的Category信息
-    revoked_categories = target_table[target_table['Category'] != '']['Category'].drop_duplicates().tolist()
-    
-    return {
-        'table': target_table,
-        'total_count': total_count,
-        'recipients': valid_recipients,
-        'cc': valid_cc,
-        'type': report_type,
-        'revoked_categories': revoked_categories  # 添加Category信息
-    }
-
-
-
-# 生成邮件HTML内容
-def generate_email_html(table_data, current_date, total_count, report_type, recipients, cc):
-    urgency_styles = {
-        '非常紧急': 'background-color:#ffebee;color:#b71c1c;font-weight:bold',
-        '紧急': 'background-color:#fff3e0;color:#e65100',
-        '常规': 'background-color:#e8f5e9;color:#2e7d32'
-    }
-    
-    # 根据报表类型设置主题和标题文本
-    if report_type == "Pending review任务提醒":
-        subject = CONFIG.get('EMAIL_SUBJECT_PENDING', report_type)
-        header_text = f"系统检测到当前有 <strong>{total_count}</strong> 条待审核（Pending Review）请求（剩余天数≤{CONFIG['MAX_REMAINING_DAYS_FOR_REPORT']}天）。为避免权限过期影响业务正常运行，请及时处理您负责的审核任务。"
-        table_headers = ['负责人（Action Owner）', '负责人邮箱 (@pg.com)', '系统名称（System Name）', '分类（Category）', '剩余天数', '紧急程度', '待审核数量']
-    elif report_type == "Revoked状态任务提醒":
-        subject = CONFIG.get('EMAIL_SUBJECT_REVOKED', report_type)
-        header_text = f"系统检测到当前有 <strong>{total_count}</strong> 条状态包含'Revoked'关键词的请求。请关注并处理这些请求。"
-        table_headers = ['负责人（Action Owner）', '负责人邮箱 (@pg.com)', '系统名称（System Name）', '分类（Category）', '状态', '状态说明', 'Revoked数量']
-    # 注释：已移除EVP Compliance邮件逻辑（无此类型数据）
-    # elif report_type == "EVP Compliance 情况和任务提醒":
-    #     subject = report_type
-    #     header_text = f"系统检测到当前有 <strong>{total_count}</strong> 条EVP Compliance相关请求。请关注并处理这些请求。"
-    #     table_headers = ['负责人（Action Owner）', '负责人邮箱 (@pg.com)', '系统名称（System Name）', '分类（Category）', '状态', '请求数量']
-    else:
-        subject = report_type
-        header_text = f"系统检测到当前有 <strong>{total_count}</strong> 条相关请求。请关注并处理这些请求。"
-        table_headers = ['负责人（Action Owner）', '负责人邮箱 (@pg.com)', '系统名称（System Name）', '分类（Category）', '状态', '请求数量']
-    
-    recipients_str = ", ".join(recipients) if recipients else "无"
-    cc_str = ", ".join(cc) if cc else "无"
-    
-    html = f"""<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; }}
-        .email-header {{ margin-bottom: 25px; padding-bottom: 15px; border-bottom: 2px solid #f0f0f0; }}
-        h2 {{ color: #2c3e50; margin-top: 0; }}
-        .urgency-desc {{ margin: 20px 0; padding: 15px; background-color: #f5f5f5; border-radius: 6px; }}
-        .recipients-info {{ margin: 15px 0; padding: 10px; background-color: #f9f9f9; border-radius: 4px; }}
-        table {{ width: 100%; border-collapse: separate; border-spacing: 0; margin: 25px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-radius: 6px; overflow: hidden; }}
-        th {{ 
-            padding: 12px 15px; 
-            text-align: left; 
-            background-color: #2c3e50; 
-            color: white; 
-            font-weight: bold; 
-            position: sticky; 
-            top: 0;
-        }}
-        td {{ 
-            padding: 12px 15px; 
-            text-align: left; 
-            border-bottom: 1px solid #f0f0f0;
-        }}
-        tr:hover {{ background-color: #f9f9f9; }}
-        tr:last-child td {{ border-bottom: none; }}
-        .total-row {{ 
-            background-color: #f1f8e9; 
-            font-weight: bold; 
-            border-top: 2px solid #2c3e50;
-        }}
-        .badge {{ 
-            padding: 5px 10px; 
-            border-radius: 15px; 
-            font-size: 0.85em; 
-            display: inline-block;
-        }}
-        .footer-note {{ margin-top: 30px; padding-top: 15px; border-top: 2px solid #f0f0f0; color: #666; }}
-        .itc-link {{ color: #2196f3; text-decoration: underline; font-weight: bold; }}
-        .status-note {{ color: #d32f2f; font-style: italic; }}
-    </style>
-</head>
-<body>
-    <div class="email-header">
-        <h2>{subject} - {current_date}</h2>
-        <p>{header_text}</p>
-        <p>请通过Chrome 浏览器（其他浏览器可能存在兼容问题）登录<a href="{CONFIG['ITC_SYSTEM_LINK']}" class="itc-link" target="_blank">ITC系统链接</a>，点击"MyTasks"/"MyActions"完成相关任务处理。</p>
-    </div>
-    
-    <div class="recipients-info">
-        <p><strong>邮件接收人 (To):</strong> {recipients_str}</p>
-        <p><strong>抄送 (CC):</strong> {cc_str}</p>
-    </div>
-    """
-    
-    # 根据报表类型添加不同的说明内容
-    if report_type == "Pending review任务提醒":
-        html += f"""
-    <div class="urgency-desc">
-        <p><strong>紧急程度说明：</strong></p>
-        <ul>
-            <li><span style="{urgency_styles['非常紧急']};padding:2px 6px;border-radius:3px">非常紧急</span>：剩余天数≤{CONFIG['URGENCY_LEVELS']['非常紧急']}天（需立即处理）</li>
-            <li><span style="{urgency_styles['紧急']};padding:2px 6px;border-radius:3px">紧急</span>：剩余天数≤{CONFIG['URGENCY_LEVELS']['紧急']}天（建议当天处理）</li>
-            <li><span style="{urgency_styles['常规']};padding:2px 6px;border-radius:3px">常规</span>：剩余天数≤{CONFIG['URGENCY_LEVELS']['常规']}天（请在过期前完成）</li>
-        </ul>
-    </div>
-        """
-    elif report_type == "Revoked状态任务提醒":
-        html += f"""
-    <div class="urgency-desc">
-        <p><strong>状态说明：</strong></p>
-        <ul>
-            <li><strong>ExitForm相关：</strong> {CONFIG['EMAIL_ExitForm_REVOKED']}</li>
-            <li><strong>RoleChange相关：</strong> {CONFIG['EMAIL_RoleChange_REVOKED']}</li>
-        </ul>
-    </div>
-        """
-    # 注释：已移除EVP Compliance说明内容（无此类型数据）
-    # elif report_type == "EVP Compliance 情况和任务提醒":
-    #     html += f"""
-    # <div class="urgency-desc">
-    #     <p><strong>EVP Compliance说明：</strong></p>
-    #     <p>此报表包含所有与EVP合规性相关的请求，请按照公司合规政策及时处理。</p>
-    # </div>
-    #     """
-    
-    # 生成汇总表格
-    html += f"""
-    <table>
-        <thead>
-            <tr>
-    """
-    for header in table_headers:
-        html += f"<th>{header}</th>"
-    
-    html += f"""
-            </tr>
-        </thead>
-        <tbody>
-    """
-    
-    for _, row in table_data.iterrows():
-        if row['Action Owner'] == '总计':
-            html += "<tr class='total-row'>"
-            html += f"<td>{row['Action Owner']}</td>"
-            for _ in range(len(table_headers) - 2):
-                html += "<td></td>"
-            if report_type == "Pending review任务提醒":
-                html += f"<td>{row.get('Pending_review数量', '')}</td>"
-            elif report_type == "Revoked状态任务提醒":
-                html += f"<td>{row.get('Revoked数量', '')}</td>"
-            # 注释：已移除EVP Compliance总计行逻辑（无此类型数据）
-            # else:
-            #     html += f"<td>{row.get('请求数量', '')}</td>"
-            html += "</tr>"
-        else:
-            html += "<tr>"
-            html += f"<td>{row['Action Owner']}</td>"
-            html += f"<td>{row['Action Owner Email']}</td>"
-            html += f"<td>{row['System Name']}</td>"
-            html += f"<td>{row['Category']}</td>"
-            
-            if report_type == "Pending review任务提醒":
-                html += f"<td>{row['剩余天数']}天</td>"
-                urgency = row['紧急程度']
-                html += f"<td><span class='badge' style='{urgency_styles[urgency]}'>{urgency}</span></td>"
-                html += f"<td>{row['Pending_review数量']}</td>"
-            elif report_type == "Revoked状态任务提醒":
-                html += f"<td>{row['Status']}</td>"
-                note = row['状态说明']
-                if note:
-                    html += f"<td class='status-note'>{note}</td>"
-                else:
-                    html += f"<td>{note}</td>"
-                html += f"<td>{row['Revoked数量']}</td>"
-            # 注释：已移除EVP Compliance表格行逻辑（无此类型数据）
-            # else:  # EVP和其他报表类型
-            #     html += f"<td>{row['Status']}</td>"
-            #     html += f"<td>{row['请求数量']}</td>"
-                
-            html += "</tr>"
-    
-    html += """
-        </tbody>
-    </table>
-    
-    <div class="footer-note">
-        <p>感谢您的及时处理！如有任何问题，请联系Site CSL团队支持。</p>
-        <p>此致<br>GC PD 网络安全团队</p>
-    </div>
-</body>
-</html>
-"""
-    return html, subject
-
-
-# 从HTML提取纯文本内容
-def html_to_text(html_content):
-    text = re.sub(r'<style.*?</style>', '', html_content, flags=re.DOTALL)
-    text = re.sub(r'<script.*?</script>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<.*?>', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
+def fix_mojibake(text):
+    if not isinstance(text, str): return text
+    if any(x in text for x in ["â€“", "Ã", "å", "æ", "é"]):
+        for enc in ["latin1", "cp1252"]:
+            try:
+                return text.encode(enc).decode("utf-8")
+            except Exception:
+                pass
     return text
 
+def apply_mojibake_fix(df):
+    if df is None or df.empty:
+        return df
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].apply(fix_mojibake)
+    return df
 
-# 保存邮件内容为HTML和TXT到指定文件夹
-def save_email_contents(html_content, output_dir, report_type):
-    ensure_directory_exists(output_dir)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    prefix = report_type.replace(' ', '_').replace('任务提醒', '').lower()
-    html_path = os.path.join(output_dir, f"{prefix}_email_{timestamp}.html")
-    txt_path = os.path.join(output_dir, f"{prefix}_email_{timestamp}.txt")
-    
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    
-    text_content = html_to_text(html_content)
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write(text_content)
-    
-    return html_path, txt_path
-
-
-# 记录日志到Log文件夹
-def log_message(message, log_dir):
-    ensure_directory_exists(log_dir)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_date = datetime.now().strftime('%Y%m%d')
-    log_file = os.path.join(log_dir, f"process_{log_date}.log")
-    
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(f"[{timestamp}] {message}\n")
-
-
-# 发送Teams消息
-def send_teams_message(message, report_type, webhook_url=None):
-    """发送消息到Teams频道"""
-    if not webhook_url:
-        webhook_url = CONFIG.get("Teams", {}).get("webhook_url", "")
-    
-    if not webhook_url or "请替换为你的" in webhook_url:
-        print("Teams webhook URL未配置，跳过发送Teams消息")
-        return False
-    
-    try:
-        payload = {
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "themeColor": "0076D7",
-            "summary": f"{report_type}通知",
-            "sections": [{
-                "activityTitle": f"{report_type}",
-                "activitySubtitle": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "text": message
-            }]
-        }
-        
-        response = requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        if response.status_code == 200:
-            print(f"Teams消息发送成功: {report_type}")
-            return True
-        else:
-            print(f"Teams消息发送失败，状态码: {response.status_code}, 响应: {response.text}")
-            return False
-    except Exception as e:
-        print(f"发送Teams消息时出错: {str(e)}")
-        return False
-
-
-# 发送邮件的辅助函数
-def send_report(report_data, reminder_dir, log_dir):
-    report_type = report_data['type']
-    total_count = report_data['total_count']
-    recipients = report_data['recipients']
-    cc = report_data['cc']
-    table_data = report_data['table']
-    
-    # 记录数量信息到日志，便于主程序解析
-    if report_type == "Revoked状态任务提醒":
-        if total_count > 0:
-            count_msg = f"发现 {total_count} 条Revoked请求"
-            print(f"信息：{count_msg}")
-            log_message(count_msg, log_dir)
-            
-            # 记录涉及的Category信息
-            revoked_categories = report_data.get('revoked_categories', [])
-            if revoked_categories:
-                categories_msg = f"Revoked请求涉及的Category: {', '.join(revoked_categories)}"
-                print(f"信息：{categories_msg}")
-                log_message(categories_msg, log_dir)
-        else:
-            no_revoked_msg = "没有包含Revoked关键词的请求数据"
-            print(f"信息：{no_revoked_msg}")
-            log_message(no_revoked_msg, log_dir)
-    elif report_type == "Pending review任务提醒":
-        if total_count > 0:
-            count_msg = f"发现 {total_count} 条待审核请求"
-            print(f"信息：{count_msg}")
-            log_message(count_msg, log_dir)
-        else:
-            no_pending_msg = "没有剩余天数小于等于 10 天的待审核请求"
-            print(f"信息：{no_pending_msg}")
-            log_message(no_pending_msg, log_dir)
-    
-    if total_count == 0:
-        return
-    
-    current_date_str = datetime.now().strftime('%Y年%m月%d日')
-    
-    generate_msg = f"生成{report_type}类型邮件内容..."
-    print(generate_msg)
-    log_message(generate_msg, log_dir)
-    
-    email_html, subject = generate_email_html(table_data, current_date_str, total_count, report_type, recipients, cc)
-    html_path, txt_path = save_email_contents(email_html, reminder_dir, report_type)
-    
-    save_msg = f"{report_type}类型邮件内容已保存到 {reminder_dir}:\nHTML: {html_path}\nTXT: {txt_path}"
-    print(save_msg)
-    log_message(save_msg, log_dir)
-    
-    # 发送Teams消息
-    teams_message = f"{report_type} - 共{total_count}条请求需要处理。详情请查看邮件。"
-    send_teams_message(teams_message, report_type)
-    
-    # 获取当前脚本所在目录
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    print(f"当前脚本目录: {current_dir}")
-    print("当前目录下的内容：")
-    for item in os.listdir(current_dir):
-        item_path = os.path.join(current_dir, item)
-        if os.path.isdir(item_path):
-            print(f"[目录] {item}")
-        else:
-            print(f"[文件] {item}")
-
-    
-    # 添加当前目录到搜索路径
-    sys.path.append(current_dir)
-    
-    try:
-        # 尝试导入邮件发送模块
-        from email_sender import send_email
-    except ImportError:
-        # 尝试绝对路径（请替换成你的实际脚本目录）
-        absolute_script_dir = r"C:\Users\liang.wq.1\Downloads\ITC_Scorecard"  # 仅路径，不包含文件名
-        print(f"当前目录未找到email_sender，尝试绝对路径: {absolute_script_dir}")
-        
-        # 添加绝对路径到搜索路径
-        sys.path.append(absolute_script_dir)
-        
+def detect_file_encoding(path, sample_size=4096):
+    cands = ["utf-8-sig", "utf-8", "gbk", "cp936", "latin1"]
+    with open(path, "rb") as f:
+        raw = f.read(sample_size)
+    for enc in cands:
         try:
-            from email_sender import send_email
-            print(f"已从绝对路径成功导入email_sender")
-        except ImportError:
-            import_err_msg = f"当前目录和绝对路径({absolute_script_dir})均未找到email_sender.py，请检查文件位置"
-            print(import_err_msg)
-            log_message(import_err_msg, log_dir)
-            return
-    
-    # 发送邮件
-    try:
-        send_msg = f"正在发送{report_type}类型邮件... 标题: {subject}, 收件人: {', '.join(recipients)}, 抄送: {', '.join(cc)}"
-        print(send_msg)
-        log_message(send_msg, log_dir)
-        
-        # 读取邮件发送配置
-        try:
-            # 尝试从主程序导入邮件配置函数
-            main_script_path = os.path.join(current_dir, 'BatRun_ITCreport_downloader_rev1.py')
-            if os.path.exists(main_script_path):
-                # 动态导入主程序的配置函数
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("main_script", main_script_path)
-                if spec is not None and spec.loader is not None:
-                    main_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(main_module)
-                    email_enabled, auto_send = main_module.get_email_settings()
-                else:
-                    raise ImportError("无法加载主程序模块")
-            else:
-                # 备用方案：从配置文件读取
-                from email_sender import load_email_config
-                email_config = load_email_config()
-                email_enabled = email_config.get('system_config', {}).get('EMAIL_ENABLED', True)
-                auto_send = email_config.get('system_config', {}).get('AUTO_SEND_EMAIL', False)
+            raw.decode(enc)
+            return enc
         except Exception:
-            email_enabled = True
-            auto_send = False  # 默认为预览模式
-        
-        if not email_enabled:
-            print(f"{report_type}类型邮件功能已禁用")
-            log_message(f"{report_type}类型邮件功能已禁用", log_dir)
-            return
-        
-        success = send_email(subject, email_html, to_addrs=recipients, cc_addrs=cc, auto_send=auto_send)
-        
-        if auto_send:
-            success_msg = f"{report_type}类型邮件已直接发送" if success else f"{report_type}类型邮件发送失败"
-        else:
-            success_msg = f"{report_type}类型邮件预览窗口已打开，请确认后发送" if success else f"{report_type}类型邮件发送失败"
-        
-        print(success_msg)
-        log_message(success_msg, log_dir)
-    except Exception as e:
-        send_err_msg = f"发送{report_type}类型邮件时出错: {str(e)}"
-        print(send_err_msg)
-        log_message(send_err_msg, log_dir)
+            pass
+    return "latin1"
 
-
-# 主函数
-def main():
-    current_script_path = os.path.abspath(__file__)
-    current_dir = os.path.dirname(current_script_path)
-    
-    itc_report_dir = os.path.abspath(os.path.join(current_dir, CONFIG["ITC_REPORT_DIR_NAME"]))
-    raw_data_dir = os.path.join(itc_report_dir, CONFIG["RAW_DATA_DIR_NAME"])
-    reminder_dir = os.path.join(itc_report_dir, CONFIG["REMINDER_DIR_NAME"])
-    log_dir = os.path.join(itc_report_dir, CONFIG["LOG_DIR_NAME"])
-    
-    print("="*60)
-    print("当前配置:")
-    print(f"邮件发送阈值: 剩余天数 ≤ {CONFIG['MAX_REMAINING_DAYS_FOR_REPORT']}天")
-    print(f"紧急程度划分: {CONFIG['URGENCY_LEVELS']}")
-    print(f"ExitForm状态说明: {CONFIG['EMAIL_ExitForm_REVOKED']}")
-    print(f"RoleChange状态说明: {CONFIG['EMAIL_RoleChange_REVOKED']}")
-    print(f"数据目录: {raw_data_dir}")
-    print(f"报告目录: {reminder_dir}")
-    print(f"已配置的报表类型: {', '.join(CONFIG['reports'].keys())}")
-    print("="*60)
-    
-    ensure_directory_exists(raw_data_dir)
-    ensure_directory_exists(reminder_dir)
-    ensure_directory_exists(log_dir)
-    
-    start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_message(f"开始处理ITC报告数据 - {start_time}", log_dir)
-    
-    csv_files = []
-    for f in os.listdir(raw_data_dir):
-        if f.lower().endswith('.csv'):
-            file_path = os.path.join(raw_data_dir, f)
-            modified_time = os.path.getmtime(file_path)
-            csv_files.append((file_path, modified_time))
-    
-    if not csv_files:
-        error_msg = f"错误：在 {raw_data_dir} 中未找到任何CSV文件"
-        print(error_msg)
-        log_message(error_msg, log_dir)
-        return
-    
-    csv_files.sort(key=lambda x: x[1], reverse=True)
-    latest_csv_path = csv_files[0][0]
-    latest_csv_time = datetime.fromtimestamp(csv_files[0][1]).strftime('%Y-%m-%d %H:%M:%S')
-    
-    info_msg = f"使用最新CSV文件: {latest_csv_path} (修改时间: {latest_csv_time})"
-    print(info_msg)
-    log_message(info_msg, log_dir)
-    
-    process_msg = "正在读取和处理数据..."
-    print(process_msg)
-    log_message(process_msg, log_dir)
-    
+def load_and_process_data(csv_file_path):
+    base_log_dir = os.path.join(os.path.dirname(csv_file_path), "..")
+    log_message(f"开始读取CSV: {csv_file_path}", base_log_dir)
+    enc_guess = detect_file_encoding(csv_file_path)
+    log_message(f"初步编码猜测: {enc_guess}", base_log_dir)
+    df = None
+    tried = []
+    for enc in [enc_guess, "utf-8-sig", "utf-8", "gbk", "cp936", "latin1"]:
+        if enc in tried: continue
+        tried.append(enc)
+        try:
+            df = pd.read_csv(csv_file_path, encoding=enc, dtype=str,
+                             na_values=["", " ", "NA"], keep_default_na=True,
+                             on_bad_lines="skip")
+            log_message(f"使用编码 {enc} 读取成功。", base_log_dir)
+            break
+        except Exception as e:
+            log_message(f"编码 {enc} 失败: {e}", base_log_dir)
+    if df is None:
+        raise RuntimeError("无法读取CSV。")
+    # 禁用 pandas future warning
+    pd.set_option('future.no_silent_downcasting', True)
+    df = df.replace(r'^\s*$', np.nan, regex=True)
     try:
-        df = load_and_process_data(latest_csv_path)
-        
-        # 输出所有Category的分布情况（辅助调试）
-        if 'Category' in df.columns:
-            print("\n===== 调试：所有Category分布 =====")
-            print(df['Category'].value_counts().to_string())
-            print("===================================\n")
-        
-        # 注释：更新分析说明（移除EVP相关）
-        analyze_msg = "正在分析请求数据（包括Pending review和Revoked）..."
-        print(analyze_msg)
-        log_message(analyze_msg, log_dir)
-        
-        results = analyze_requests(df)
-        
-        # 发送各类报表（仅Pending和Revoked，EVP已移除）
-        for report_type, report_data in results.items():
-            send_report(report_data, reminder_dir, log_dir)
-            
-    except Exception as e:
-        error_msg = f"处理数据时发生错误: {str(e)}"
-        print(error_msg)
-        log_message(error_msg, log_dir)
-        return
-    
-    end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    complete_msg = f"ITC报告数据处理完成 - {end_time}"
-    log_message(complete_msg, log_dir)
-    print(complete_msg)
+        df = df.infer_objects(copy=False)
+    except Exception:
+        pass
+    df = apply_mojibake_fix(df)
+    for col in ["Requested Date", "Expiration Date", "Log Date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    df["is_new_request"] = df["Requester"].notna().astype(int) if "Requester" in df.columns else 0
+    df["request_group"] = df["is_new_request"].cumsum()
+    fill_cols = [
+        "Requester","Requester Email","Request For","Request For Email","Requested Date","Area","Category","Category Description",
+        "System/Solution","System/Solution Description","Approval Text","Owner Guidelines","Expiration Date","Max Request Age (Days)",
+        "Access Type","Temporary Access?","Privileged?","Status","Confirmed?","Reason","Remark/Role","Employee Status",
+        "Log Actor","Log Status","Log Date","Request ID"
+    ]
+    for col in fill_cols:
+        if col in df.columns:
+            df[col] = df.groupby("request_group")[col].transform(lambda x: x.ffill().bfill())
+    log_message(f"读取完成: 行数={len(df)} 列数={len(df.columns)}", base_log_dir)
+    return df
 
+SITE_COLUMNS_PRIORITY = ["Site", "Site ID", "SiteID", "Site_Id", "Area", "Category"]
+
+def extract_site_tokens(row):
+    for col in SITE_COLUMNS_PRIORITY:
+        if col in row.index and pd.notna(row[col]) and str(row[col]).strip():
+            raw = str(row[col]).strip()
+            parts = re.split(r"[,\s;/]+", raw)
+            toks = [p.strip().upper() for p in parts if p.strip()]
+            if toks:
+                return toks
+    return []
+
+def match_cc1_emails_by_sites(site_tokens, report_type):
+    cc1_cfg = CONFIG["reports"].get(report_type, {}).get("cc1", {})
+    found = set()
+    for token in site_tokens:
+        for key, emails in cc1_cfg.items():
+            kn = key.strip().upper()
+            if token == kn or token in kn or kn in token:
+                for e in emails:
+                    found.add(ensure_pg_email(e))
+    return sorted(found)
+
+def analyze_requests(df):
+    log_message("开始分析数据", os.getcwd())
+    for col in ["Status", "System/Solution", "Request For", "Category"]:
+        if col not in df.columns:
+            raise ValueError(f"缺少列: {col}")
+    pending_df = df[(df["Status"] == "Pending Review") & df["System/Solution"].notna() & df["Request For"].notna() & df["Category"].notna()].copy()
+    revoked_df = df[(df["Status"].str.contains("Revoked", case=False, na=False)) & df["System/Solution"].notna() & df["Request For"].notna() & df["Category"].notna()].copy()
+    log_message(f"Pending Review 行: {len(pending_df)} Revoked 行: {len(revoked_df)}", os.getcwd())
+    today = date.today()
+    return {
+        "pending": process_pending_requests(pending_df, today),
+        "revoked": process_revoked_requests(revoked_df, today)
+    }
+
+def process_pending_requests(pending_df, current_date):
+    rpt = "Pending review任务提醒"
+    cv = cfg_values()
+    max_days = cv["MAX_REMAINING_DAYS_FOR_REPORT"]
+    urgency = cv["URGENCY_LEVELS"]
+    if pending_df.empty:
+        empty = pd.DataFrame(columns=["Action Owner","Action Owner Email","System Name","Category","剩余天数","紧急程度","Pending_review数量"])
+        return {"table": empty, "total_count": 0, "recipients": CONFIG["reports"][rpt].get("recipients", []), "cc": CONFIG["reports"][rpt].get("cc", []), "type": rpt, "items": []}
+    pending_df["expiration_date_only"] = pending_df["Expiration Date"].dt.date if "Expiration Date" in pending_df.columns else pd.NaT
+    def remaining(row):
+        if pd.notna(row["expiration_date_only"]):
+            return max((row["expiration_date_only"] - current_date).days, 0)
+        return max_days
+    pending_df["剩余天数"] = pending_df.apply(remaining, axis=1).astype(int)
+    filtered = pending_df[pending_df["剩余天数"] <= max_days].copy()
+    if filtered.empty:
+        empty = pd.DataFrame(columns=["Action Owner","Action Owner Email","System Name","Category","剩余天数","紧急程度","Pending_review数量"])
+        return {"table": empty, "total_count": 0, "recipients": CONFIG["reports"][rpt].get("recipients", []), "cc": CONFIG["reports"][rpt].get("cc", []), "type": rpt, "items": []}
+    def mark(d):
+        if d <= urgency["非常紧急"]: return "非常紧急"
+        if d <= urgency["紧急"]: return "紧急"
+        return "常规"
+    filtered["紧急程度"] = filtered["剩余天数"].apply(mark)
+    def owner_info(g):
+        approvals = g[g["Log Status"].isin(["Approved","PartiallyApproved"])] if "Log Status" in g.columns else pd.DataFrame()
+        if not approvals.empty and "Log Date" in approvals.columns:
+            latest = approvals.loc[approvals["Log Date"].idxmax()]
+            em = ensure_pg_email(latest.get("Log Actor Email",""), latest.get("Log Actor",""))
+            return latest.get("Log Actor","未知"), em
+        rq = g["Requester"].iloc[0] if "Requester" in g.columns and pd.notna(g["Requester"].iloc[0]) else "未知"
+        rq_email = g["Requester Email"].iloc[0] if "Requester Email" in g.columns else ""
+        return rq, ensure_pg_email(rq_email, rq)
+    rows = []
+    for _, grp in filtered.groupby("request_group"):
+        ao, ao_email = owner_info(grp)
+        first = grp.iloc[0]
+        site_tokens = extract_site_tokens(first)
+        rows.append({
+            "Action Owner": ao,
+            "Action Owner Email": ao_email,
+            "System/Solution": first.get("System/Solution"),
+            "Category": first.get("Category"),
+            "SiteTokens": site_tokens,
+            "剩余天数": int(first.get("剩余天数", 0)),
+            "紧急程度": first.get("紧急程度"),
+            "Request ID": first.get("Request ID", "N/A")
+        })
+    df_owner = pd.DataFrame(rows)
+    agg = df_owner.groupby(["Action Owner","Action Owner Email","System/Solution","Category","剩余天数","紧急程度"]).size().reset_index(name="Pending_review数量")
+    agg.rename(columns={"System/Solution": "System Name"}, inplace=True)
+    total = int(agg["Pending_review数量"].sum())
+    agg = pd.concat([agg, pd.DataFrame([{"Action Owner": "总计","Action Owner Email":"","System Name":"","Category":"","剩余天数":"","紧急程度":"","Pending_review数量": total}])], ignore_index=True)
+    config_rec = CONFIG["reports"][rpt].get("recipients", [])
+    config_cc = CONFIG["reports"][rpt].get("cc", [])
+    data_rec = df_owner["Action Owner Email"].dropna().unique().tolist()
+    all_site_tokens = set(t for toks in df_owner["SiteTokens"] for t in toks)
+    cc1_emails = match_cc1_emails_by_sites(all_site_tokens, rpt)
+    recipients = sorted(list(set([ensure_pg_email(e) for e in config_rec + data_rec if e])))
+    cc_all = sorted(list(set([ensure_pg_email(e) for e in config_cc + cc1_emails if e])))
+    cc_all = [e for e in cc_all if e not in recipients]
+    return {"table": agg, "total_count": total, "recipients": recipients, "cc": cc_all, "type": rpt, "items": rows}
+
+def process_revoked_requests(revoked_df, current_date):
+    rpt = "Revoked状态任务提醒"
+    cv = cfg_values()
+    exit_note = cv["EMAIL_ExitForm_REVOKED"]
+    role_note = cv["EMAIL_RoleChange_REVOKED"]
+    if revoked_df.empty:
+        empty = pd.DataFrame(columns=["Action Owner","Action Owner Email","System Name","Category","状态","状态说明","Revoked数量"])
+        return {"table": empty, "total_count": 0, "recipients": CONFIG["reports"][rpt].get("recipients", []), "cc": CONFIG["reports"][rpt].get("cc", []), "type": rpt, "items": []}
+    def status_note(st):
+        if pd.isna(st): return ""
+        s = str(st).lower()
+        if "exitform" in s: return exit_note
+        if "rolechange" in s: return role_note
+        return ""
+    revoked_df["状态说明"] = revoked_df["Status"].apply(status_note)
+    def owner(g):
+        confirmed = g[g["Log Status"].str.contains("confirmed", case=False, na=False)] if "Log Status" in g.columns else pd.DataFrame()
+        if not confirmed.empty and "Log Date" in confirmed.columns:
+            latest = confirmed.loc[confirmed["Log Date"].idxmax()]
+            em = ensure_pg_email(latest.get("Log Actor Email",""), latest.get("Log Actor",""))
+            return latest.get("Log Actor","未知"), em
+        if "Log Date" in g.columns and not g["Log Date"].isna().all():
+            latest = g.loc[g["Log Date"].idxmax()]
+            em = ensure_pg_email(latest.get("Log Actor Email",""), latest.get("Log Actor",""))
+            return latest.get("Log Actor","未知"), em
+        rq = g["Requester"].iloc[0] if "Requester" in g.columns and pd.notna(g["Requester"].iloc[0]) else "未知"
+        rq_email = g["Requester Email"].iloc[0] if "Requester Email" in g.columns else ""
+        return rq, ensure_pg_email(rq_email, rq)
+    rows = []
+    for _, grp in revoked_df.groupby("request_group"):
+        ao, ao_email = owner(grp)
+        first = grp.iloc[0]
+        site_tokens = extract_site_tokens(first)
+        rows.append({
+            "Action Owner": ao,
+            "Action Owner Email": ao_email,
+            "System/Solution": first.get("System/Solution"),
+            "Category": first.get("Category"),
+            "SiteTokens": site_tokens,
+            "Status": first.get("Status"),
+            "状态说明": first.get("状态说明"),
+            "Request ID": first.get("Request ID", "N/A")
+        })
+    df_owner = pd.DataFrame(rows)
+    agg = df_owner.groupby(["Action Owner","Action Owner Email","System/Solution","Category","Status","状态说明"]).size().reset_index(name="Revoked数量")
+    agg.rename(columns={"System/Solution": "System Name"}, inplace=True)
+    total = int(agg["Revoked数量"].sum())
+    agg = pd.concat([agg, pd.DataFrame([{"Action Owner":"总计","Action Owner Email":"","System Name":"","Category":"","Status":"","状态说明":"","Revoked数量": total}])], ignore_index=True)
+    config_rec = CONFIG["reports"][rpt].get("recipients", [])
+    config_cc = CONFIG["reports"][rpt].get("cc", [])
+    data_rec = df_owner["Action Owner Email"].dropna().unique().tolist()
+    all_site_tokens = set(t for toks in df_owner["SiteTokens"] for t in toks)
+    cc1_emails = match_cc1_emails_by_sites(all_site_tokens, rpt)
+    recipients = sorted(list(set([ensure_pg_email(e) for e in config_rec + data_rec if e])))
+    cc_all = sorted(list(set([ensure_pg_email(e) for e in config_cc + cc1_emails if e])))
+    cc_all = [e for e in cc_all if e not in recipients]
+    return {"table": agg, "total_count": total, "recipients": recipients, "cc": cc_all, "type": rpt, "items": rows}
+
+def dataframe_to_markdown(df):
+    if df.empty: return "_无数据_"
+    headers = df.columns.tolist()
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |"
+    ]
+    for _, r in df.iterrows():
+        lines.append("| " + " | ".join("" if pd.isna(r[h]) else str(r[h]) for h in headers) + " |")
+    return "\n".join(lines)
+
+def build_teams_markdown(report_data, subject):
+    cv = cfg_values()
+    if report_data["type"] == "Pending review任务提醒":
+        # 计算紧急程度统计
+        df_body = report_data["table"][report_data["table"]["Action Owner"] != "总计"].copy()
+        stats_extreme = int((df_body.get("紧急程度") == "非常紧急").sum()) if "紧急程度" in df_body.columns else 0
+        stats_urgent = int((df_body.get("紧急程度") == "紧急").sum()) if "紧急程度" in df_body.columns else 0
+        stats_normal = int((df_body.get("紧急程度") == "常规").sum()) if "紧急程度" in df_body.columns else 0
+        
+        # 构建优美的 markdown 格式（无完整表格，避免超时）
+        urgency_lines = []
+        if stats_extreme > 0:
+            urgency_lines.append(f"🔴 **非常紧急**: {stats_extreme} 条 (需立即处理)")
+        if stats_urgent > 0:
+            urgency_lines.append(f"🟠 **紧急**: {stats_urgent} 条 (建议当天处理)")
+        if stats_normal > 0:
+            urgency_lines.append(f"🟢 **常规**: {stats_normal} 条 (请在过期前完成)")
+        
+        urgency_section = "\n".join(urgency_lines) if urgency_lines else "无紧急项"
+        
+        # 获取前5条明细摘要
+        detail_lines = []
+        for idx, (_, row) in enumerate(df_body.iterrows()):
+            if idx >= 5:
+                remaining = len(df_body) - 5
+                detail_lines.append(f"... 还有 {remaining} 条")
+                break
+            ao = row.get("Action Owner", "")
+            sys = row.get("System Name", "")
+            cat = row.get("Category", "")
+            urgency = row.get("紧急程度", "")
+            qty = row.get("Pending_review数量", "")
+            if urgency == "非常紧急":
+                emoji = "🔴"
+            elif urgency == "紧急":
+                emoji = "🟠"
+            else:
+                emoji = "🟢"
+            detail_lines.append(f"{emoji} {ao} | {sys} | {cat} ({qty}条)")
+        
+        details_section = "\n".join(detail_lines) if detail_lines else "无明细"
+        
+        intro = f"""### {subject}
+
+**✅ 系统检测到当前有 {report_data['total_count']} 条待审核请求**
+
+**紧急程度统计：**
+{urgency_section}
+
+**待审核摘要：**
+{details_section}
+
+---
+
+**处理要求：**
+为避免权限过期影响业务正常运行，请及时处理您负责的审核任务。
+
+请通过 Chrome 浏览器（其他浏览器可能存在兼容问题）登录 [ITC 系统]({cv['ITC_SYSTEM_LINK']})，点击 **MyTasks / MyActions** 完成相关任务处理。
+"""
+        return intro
+    else:
+        # Revoked 消息
+        detail_lines = []
+        df_body = report_data["table"][report_data["table"]["Action Owner"] != "总计"].copy()
+        for idx, (_, row) in enumerate(df_body.iterrows()):
+            if idx >= 5:
+                remaining = len(df_body) - 5
+                detail_lines.append(f"... 还有 {remaining} 条")
+                break
+            ao = row.get("Action Owner", "")
+            sys = row.get("System Name", "")
+            status = row.get("Status", "")
+            qty = row.get("Revoked数量", "")
+            detail_lines.append(f"⚠️  {ao} | {sys} | {status} ({qty}条)")
+        
+        details_section = "\n".join(detail_lines) if detail_lines else "无明细"
+        
+        intro = f"""### {subject}
+
+**⚠️ 当前 Revoked 总数：{report_data['total_count']}**
+
+**Revoked 摘要：**
+{details_section}
+
+---
+
+**处理要求：**
+请核查状态说明并在系统中完成权限确认与清理。
+
+[查看 ITC 系统]({cv['ITC_SYSTEM_LINK']})
+"""
+        return intro
+
+def html_to_text(html):
+    txt = re.sub(r"<style.*?</style>", "", html, flags=re.DOTALL)
+    txt = re.sub(r"<script.*?</script>", "", txt, flags=re.DOTALL)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    return " ".join(txt.split())
+
+def save_email_contents(html, out_dir, report_type):
+    ensure_directory_exists(out_dir)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = report_type.replace(" ", "_")
+    hp = os.path.join(out_dir, f"{prefix}_email_{ts}.html")
+    tp = os.path.join(out_dir, f"{prefix}_email_{ts}.txt")
+    with open(hp, "w", encoding="utf-8") as f:
+        f.write(html)
+    with open(tp, "w", encoding="utf-8") as f:
+        f.write(html_to_text(html))
+    return hp, tp
+
+def format_cn_date(s):
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return f"{dt.year}年{dt.month}月{dt.day}日"
+    except Exception:
+        return s
+
+def _compute_pending_urgency_stats(table_data):
+    df = table_data[table_data.get("Action Owner") != "总计"].copy()
+    stats = {
+        "非常紧急": int((df.get("紧急程度") == "非常紧急").sum()) if "紧急程度" in df.columns else 0,
+        "紧急": int((df.get("紧急程度") == "紧急").sum()) if "紧急程度" in df.columns else 0,
+        "常规": int((df.get("紧急程度") == "常规").sum()) if "紧急程度" in df.columns else 0
+    }
+    stats["总计"] = sum(stats.values())
+    return stats
+# ...existing code...
+
+def generate_email_html(table_data, current_date, total_count, report_type, recipients, cc):
+    cv = cfg_values()
+    link = cv["ITC_SYSTEM_LINK"]
+    cn_date = format_cn_date(current_date)
+    to_str = ", ".join(recipients) if recipients else "无"
+    cc_str = ", ".join(cc) if cc else "无"
+
+    def fmt_days(v):
+        if v is None or str(v).strip() == "":
+            return ""
+        try:
+            return f"{int(v)}天"
+        except Exception:
+            return str(v)
+
+    if report_type == "Pending review任务提醒":
+        subject = f"{cv['EMAIL_SUBJECT_PENDING']} - {cn_date}"
+        df_body = table_data[table_data["Action Owner"] != "总计"].copy()
+        stats_extreme = int((df_body.get("紧急程度") == "非常紧急").sum()) if "紧急程度" in df_body.columns else 0
+        stats_urgent = int((df_body.get("紧急程度") == "紧急").sum()) if "紧急程度" in df_body.columns else 0
+        stats_normal = int((df_body.get("紧急程度") == "常规").sum()) if "紧急程度" in df_body.columns else 0
+        rows_html = []
+        for _, row in table_data.iterrows():
+            if row.get("Action Owner") == "总计":
+                rows_html.append(
+                    "<tr class='total-row'>"
+                    "<td>总计</td><td></td><td></td><td></td>"
+                    "<td></td><td></td>"
+                    f"<td>{row.get('Pending_review数量','')}</td></tr>"
+                )
+            else:
+                urg = row.get("紧急程度", "")
+                badge_class = {
+                    "非常紧急": "badge-critical",
+                    "紧急": "badge-warning",
+                    "常规": "badge-normal"
+                }.get(urg, "badge-normal")
+                highlight_row = {
+                    "非常紧急": "row-critical",
+                    "紧急": "row-warning"
+                }.get(urg, "")
+                rows_html.append(
+                    f"<tr class='{highlight_row}'>"
+                    f"<td>{row.get('Action Owner','')}</td>"
+                    f"<td>{row.get('Action Owner Email','')}</td>"
+                    f"<td>{row.get('System Name','')}</td>"
+                    f"<td>{row.get('Category','')}</td>"
+                    f"<td>{fmt_days(row.get('剩余天数',''))}</td>"
+                    f"<td><span class='badge {badge_class}'>{urg}</span></td>"
+                    f"<td>{row.get('Pending_review数量','')}</td>"
+                    "</tr>"
+                )
+
+        html = f"""<html><head><meta charset="UTF-8">
+<style>
+body {{
+  font-family:"Segoe UI",Arial,sans-serif; background:#f5f7fa;
+  margin:0; padding:24px; color:#1f2937; line-height:1.6; font-size:11pt;
+}}
+h2 {{ margin:0 0 16px; font-weight:600; color:#0f4c81; letter-spacing:.5px; font-size:14pt; }}
+p {{ margin:0 0 12px; font-size:11pt; }}
+.section-title {{
+  font-weight:600; color:#0f4c81; margin:30px 0 8px; font-size:12.5pt;
+  border-left:4px solid #0f4c81; padding-left:8px;
+}}
+.info-box {{
+  background:#ffffff; border:1px solid #e2e8f0; border-radius:10px;
+  padding:14px 18px; margin-bottom:18px; box-shadow:0 1px 3px rgba(0,0,0,0.05);
+  font-size:11pt;
+}}
+.summary-cards {{ display:flex; gap:14px; flex-wrap:wrap; margin:18px 0 8px; }}
+.card {{
+  background:#fff; border:1px solid #e2e8f0; border-radius:10px;
+  padding:10px 14px; min-width:140px; box-shadow:0 1px 2px rgba(0,0,0,0.05);
+}}
+.card h4 {{ margin:0 0 4px; font-size:11pt; font-weight:600; color:#475569; }}
+.card .num {{ font-size:18pt; font-weight:600; }}
+.card-critical .num {{ color:#c62828; }}
+.card-warning .num {{ color:#ef6c00; }}
+.card-normal .num {{ color:#2e7d32; }}
+
+.urgency-desc p {{ margin:4px 0; }}
+.line-critical {{ color:#c62828; font-weight:600; }}
+.line-warning {{ color:#ef6c00; font-weight:600; }}
+.line-normal {{ color:#2e7d32; font-weight:600; }}
+
+table {{
+  width:100%; border-collapse:separate; border-spacing:0;
+  background:#fff; border:1px solid #d9e3ec; border-radius:12px;
+  overflow:hidden; margin-top:6px;
+}}
+thead th {{
+  background:linear-gradient(90deg,#0f4c81,#1769aa);
+  color:#fff; padding:10px 12px; font-size:12.5px; letter-spacing:.6px;
+  text-align:left;
+}}
+tbody td {{
+  padding:8px 12px; font-size:12.5px; border-top:1px solid #eef2f7;
+}}
+tbody tr:nth-child(even) td {{ background:#f9fbfd; }}
+.row-critical td {{ background:#fff5f5; }}
+.row-warning td {{ background:#fff9ed; }}
+.total-row td {{
+  background:#eef6ff; font-weight:600; border-top:2px solid #c2d9f3;
+}}
+
+.badge {{
+  display:inline-block; padding:4px 11px; border-radius:15px;
+  font-size:11px; font-weight:600; letter-spacing:.5px;
+}}
+.badge-critical {{ background:#ffebee; color:#c62828; }}
+.badge-warning {{ background:#fff3e0; color:#ef6c00; }}
+.badge-normal {{ background:#e8f5e9; color:#2e7d32; }}
+
+.footer {{
+  margin-top:28px; font-size:11pt; color:#64748b;
+  border-top:1px solid #e2e8f0; padding-top:14px;
+}}
+a {{ color:#0f4c81; text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+
+.signature {{
+  margin-top:20px; font-size:11.5pt; font-weight:500; color:#0f4c81;
+}}
+</style></head><body>
+<h2>{subject}</h2>
+<div class="info-box">
+<p>系统检测到当前有 <strong>{total_count}</strong> 条待审核（Pending Review）请求（剩余天数 ≤ 10 天）。为避免权限过期影响业务正常运行，请及时处理您负责的审核任务。</p>
+<p>请通过 <strong>Chrome 浏览器</strong>（其他浏览器可能存在兼容问题）登录 ITC 系统：<a href="{link}" target="_blank">{link}</a>，点击 <strong>MyTasks / MyActions</strong> 完成相关任务处理。</p>
+<p><b>邮件接收人 (To):</b> {to_str}<br><b>抄送 (CC):</b> {cc_str}</p>
+</div>
+
+<div class="section-title">紧急程度说明</div>
+<div class="info-box urgency-desc">
+<p class="line-critical">非常紧急： 剩余天数 ≤ {cv['URGENCY_LEVELS']['非常紧急']} 天（需立即处理）</p>
+<p class="line-warning">紧急： 剩余天数 ≤ {cv['URGENCY_LEVELS']['紧急']} 天（建议当天处理）</p>
+<p class="line-normal">常规： 剩余天数 ≤ {cv['URGENCY_LEVELS']['常规']} 天（请在过期前完成）</p>
+</div>
+
+<div class="summary-cards">
+  <div class="card card-critical"><h4>非常紧急</h4><div class="num">{stats_extreme}</div></div>
+  <div class="card card-warning"><h4>紧急</h4><div class="num">{stats_urgent}</div></div>
+  <div class="card card-normal"><h4>常规</h4><div class="num">{stats_normal}</div></div>
+  <div class="card"><h4>总计</h4><div class="num">{total_count}</div></div>
+</div>
+
+<div class="section-title">待审核明细</div>
+<table>
+<thead><tr>
+<th>负责人 (Action Owner)</th>
+<th>负责人邮箱 (@pg.com)</th>
+<th>系统名称 (System Name)</th>
+<th>分类 (Category)</th>
+<th>剩余天数</th>
+<th>紧急程度</th>
+<th>待审核数量</th>
+</tr></thead>
+<tbody>{''.join(rows_html)}</tbody>
+</table>
+
+<div class="footer">
+感谢您的及时处理！如有任何问题，请联系 Site CSL 团队支持。
+</div>
+<div class="signature">此致<br>GC PD 网络安全团队</div>
+</body></html>"""
+        return html, subject
+
+    subject = f"{cv['EMAIL_SUBJECT_REVOKED']} - {cn_date}"
+    rows_html = []
+    for _, row in table_data.iterrows():
+        if row.get("Action Owner") == "总计":
+            rows_html.append(
+                "<tr class='total-row'>"
+                "<td>总计</td><td></td><td></td><td></td><td></td><td></td>"
+                f"<td>{row.get('Revoked数量','')}</td></tr>"
+            )
+        else:
+            rows_html.append(
+                "<tr>"
+                f"<td>{row.get('Action Owner','')}</td>"
+                f"<td>{row.get('Action Owner Email','')}</td>"
+                f"<td>{row.get('System Name','')}</td>"
+                f"<td>{row.get('Category','')}</td>"
+                f"<td>{row.get('Status','')}</td>"
+                f"<td>{row.get('状态说明','')}</td>"
+                f"<td>{row.get('Revoked数量','')}</td>"
+                "</tr>"
+            )
+    html = f"""<html><head><meta charset="UTF-8">
+<style>
+body{{font-family:"Segoe UI",Arial,sans-serif;background:#f6f8fa;padding:24px;color:#1f2937;line-height:1.6;font-size:11pt}}
+h2{{margin:0 0 16px;font-weight:600;color:#0f4c81;letter-spacing:.5px;font-size:14pt}}
+table{{width:100%;border-collapse:separate;border-spacing:0;background:#fff;border:1px solid #d9e3ec;border-radius:12px;overflow:hidden;margin-top:6px}}
+thead th{{background:#374151;color:#fff;padding:10px 12px;font-size:11pt;text-align:left;letter-spacing:.6px}}
+tbody td{{padding:8px 12px;font-size:11pt;border-top:1px solid #eef2f7}}
+tbody tr:nth-child(even) td{{background:#f9fbfd}}
+.total-row td{{background:#eef6ff;font-weight:600;border-top:2px solid #c2d9f3}}
+.info-box{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 18px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,0.05);font-size:11pt}}
+.footer{{margin-top:24px;font-size:11pt;color:#64748b;border-top:1px solid #e2e8f0;padding-top:14px}}
+a{{color:#0f4c81;text-decoration:none}}a:hover{{text-decoration:underline}}
+.signature{{margin-top:20px;font-size:11.5pt;font-weight:500;color:#0f4c81}}
+</style></head><body>
+<h2>{subject}</h2>
+<div class="info-box">
+<p>当前 Revoked 总数 <strong>{total_count}</strong>。请核查状态说明并在系统中完成权限确认与清理。</p>
+<p>系统链接：<a href="{link}" target="_blank">{link}</a></p>
+<p><b>邮件接收人 (To):</b> {to_str}<br><b>抄送 (CC):</b> {cc_str}</p>
+</div>
+<table>
+<thead><tr>
+<th>负责人 (Action Owner)</th>
+<th>负责人邮箱 (@pg.com)</th>
+<th>系统名称 (System Name)</th>
+<th>分类 (Category)</th>
+<th>状态 (Status)</th>
+<th>状态说明</th>
+<th>数量</th>
+</tr></thead>
+<tbody>{''.join(rows_html)}</tbody>
+</table>
+<div class="footer">提示: 请根据状态说明及时处理（ExitForm / RoleChange）。</div>
+<div class="signature">此致<br>GC PD 网络安全团队</div>
+</body></html>"""
+    return html, subject
+
+def send_to_teams_simple_markdown(subject, markdown_content, log_dir):
+    try:
+        tc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "teams_config.json")
+        url = ""
+        if os.path.exists(tc_path):
+            with open(tc_path, "r", encoding="utf-8") as f:
+                tcfg = json.load(f)
+            if tcfg.get("enabled"):
+                def_name = tcfg.get("default_webhook")
+                url = tcfg.get("webhooks", {}).get(def_name, "")
+        if not url:
+            url = CONFIG.get("Teams", {}).get("webhook_url", "").strip()
+    except Exception:
+        url = CONFIG.get("Teams", {}).get("webhook_url", "").strip()
+    if not url:
+        log_message("Teams simple fallback 无URL", log_dir)
+        return False
+    payload = {"text": f"{subject}\n{markdown_content[:7000]}"}
+    try:
+        r = requests.post(url, json=payload, timeout=25)
+        log_message(f"SimpleWebhook HTTP {r.status_code}", log_dir)
+        return 200 <= r.status_code < 300
+    except Exception as e:
+        log_message(f"Teams simple 异常: {e}", log_dir)
+        return False
+
+def send_health_probe(log_dir):
+    url = CONFIG.get("Teams", {}).get("webhook_url", "").strip()
+    if not url:
+        log_message("健康检测: 无URL", log_dir)
+        return
+    try:
+        r = requests.post(url, json={"text": "健康探测"}, timeout=10)
+        log_message(f"健康检测状态: {r.status_code}", log_dir)
+    except Exception as e:
+        log_message(f"健康检测异常: {e}", log_dir)
+
+SCRIPT_VERSION = "pending_report_v9_trace"
+
+def _trace_banner():
+    print(f"[TRACE] pending_review_report loaded VERSION={SCRIPT_VERSION} FILE={__file__}")
+
+_trace_banner()
+
+def send_report(report_data, reminder_dir, log_dir):
+    log_message(f"[DEBUG] send_report() 被调用, type={report_data.get('type')}, total_count={report_data.get('total_count')}", log_dir)
+    log_message(f"[VER {SCRIPT_VERSION}] 开始发送报告: {report_data['type']}", log_dir)
+    if report_data["total_count"] == 0:
+        log_message(f"[VER {SCRIPT_VERSION}] {report_data['type']} 无数据跳过", log_dir)
+        return
+    now_str = datetime.now().strftime("%Y-%m-%d")
+    email_html, subject = generate_email_html(report_data["table"], now_str, report_data["total_count"],
+                                              report_data["type"], report_data["recipients"], report_data["cc"])
+    log_message(f"[VER {SCRIPT_VERSION}] 邮件HTML生成 subject={subject}", log_dir)
+    html_path, _ = save_email_contents(email_html, reminder_dir, report_data["type"])
+    log_message(f"[VER {SCRIPT_VERSION}] 保存邮件文件: {html_path}", log_dir)
+
+    send_email_func = None
+    email_enabled = True
+    try:
+        from email_sender import send_email as _send_email, load_email_config
+        ecfg = load_email_config()
+        email_enabled = ecfg.get("system_config", {}).get("EMAIL_ENABLED", True)
+        send_email_func = _send_email
+        log_message(f"[VER {SCRIPT_VERSION}] 邮件模块加载完成 ENABLED={email_enabled}", log_dir)
+    except Exception as e:
+        log_message(f"[VER {SCRIPT_VERSION}] 邮件模块加载失败: {e}", log_dir)
+
+    if email_enabled and send_email_func and (report_data["recipients"] or report_data["cc"]):
+        try:
+            log_message(f"[VER {SCRIPT_VERSION}] 邮件发送开始...", log_dir)
+            ok = send_email_func(subject, email_html,
+                                 to_addrs=report_data["recipients"], cc_addrs=report_data["cc"])
+            log_message(f"[VER {SCRIPT_VERSION}] 邮件发送结果={ok}", log_dir)
+        except Exception as e:
+            log_message(f"[VER {SCRIPT_VERSION}] 邮件发送异常: {e}", log_dir)
+            log_message(traceback.format_exc(), log_dir)
+    else:
+        log_message(f"[VER {SCRIPT_VERSION}] 邮件阶段跳过 ENABLED={email_enabled} to={len(report_data['recipients']) if report_data else 0} cc={len(report_data['cc']) if report_data else 0}", log_dir)
+
+    log_message(f"[VER {SCRIPT_VERSION}] 准备进入Teams阶段", log_dir)
+    md = build_teams_markdown(report_data, subject)
+    urgent_flag = False
+    rule_key = "normal_issues"
+    if report_data["type"] == "Pending review任务提醒":
+        urgent_flag = any(it.get("紧急程度") == "非常紧急" for it in report_data["items"])
+        rule_key = "urgent_issues" if urgent_flag else "normal_issues"
+    elif report_data["type"] == "Revoked状态任务提醒":
+        rule_key = "revoked_issues"
+    log_message(f"[VER {SCRIPT_VERSION}] 规则判定 rule_key={rule_key} urgent={urgent_flag}", log_dir)
+
+    teams_success = False
+    try:
+        log_message(f"[VER {SCRIPT_VERSION}] 即将导入 teams_sender", log_dir)
+        if "teams_sender" in sys.modules:
+            del sys.modules["teams_sender"]
+        import teams_sender
+        log_message(f"[VER {SCRIPT_VERSION}] 已导入 teams_sender 路径={getattr(teams_sender,'__file__','?')}", log_dir)
+        tc = teams_sender.load_teams_config()
+        log_message(f"[VER {SCRIPT_VERSION}] Teams配置 enabled={tc.get('enabled')} default={tc.get('default_webhook')} webhooks={list(tc.get('webhooks',{}).keys())}", log_dir)
+        rules = tc.get("notification_rules", {})
+        webhook_name = rules.get(rule_key, {}).get("webhook", tc.get("default_webhook",""))
+        log_message(f"[VER {SCRIPT_VERSION}] 选定 webhook_name={webhook_name}", log_dir)
+        if not tc.get("enabled"):
+            log_message(f"[VER {SCRIPT_VERSION}] Teams未启用跳过", log_dir)
+        else:
+            ok, msg = teams_sender.send_teams_message(subject, md, webhook_name or tc.get("default_webhook",""),
+                                                      urgent_flag, teams_config=tc)
+            log_message(f"[VER {SCRIPT_VERSION}] 卡片发送结果 ok={ok} msg={msg}", log_dir)
+            teams_success = ok
+    except Exception as e:
+        log_message(f"[VER {SCRIPT_VERSION}] Teams发送异常: {e}", log_dir)
+        log_message(traceback.format_exc(), log_dir)
+
+    if not teams_success:
+        log_message(f"[VER {SCRIPT_VERSION}] 尝试 fallback simple", log_dir)
+        fb = send_to_teams_simple_markdown(subject, md, log_dir)
+        log_message(f"[VER {SCRIPT_VERSION}] fallback结果={fb}", log_dir)
+        teams_success = teams_success or fb
+
+    log_message(f"[VER {SCRIPT_VERSION}] 最终Teams状态={teams_success}", log_dir)
+
+def main(selected_csv_path=None):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    itc_dir = os.path.join(base_dir, get_cfg("ITC_REPORT_DIR_NAME"))
+    raw_dir = os.path.join(itc_dir, get_cfg("RAW_DATA_DIR_NAME"))
+    reminder_dir = os.path.join(itc_dir, get_cfg("REMINDER_DIR_NAME"))
+    log_dir = os.path.join(itc_dir, get_cfg("LOG_DIR_NAME"))
+    for p in [raw_dir, reminder_dir, log_dir]: ensure_directory_exists(p)
+    log_message(f"目录初始化: ITC_DIR='{itc_dir}' RAW='RawData' REMINDER='Reminder' LOG='Log'", log_dir)
+    log_message("开始处理报告", log_dir)
+
+    if selected_csv_path and os.path.exists(selected_csv_path):
+        csv_path = selected_csv_path
+        log_message(f"使用指定CSV: {csv_path}", log_dir)
+    else:
+        csv_files = [(os.path.join(raw_dir, f), os.path.getmtime(os.path.join(raw_dir, f)))
+                     for f in os.listdir(raw_dir) if f.lower().endswith(".csv")]
+        if not csv_files:
+            log_message("未找到CSV文件", log_dir)
+            return 1
+        csv_files.sort(key=lambda x: x[1], reverse=True)
+        csv_path = csv_files[0][0]
+        log_message(f"选取最新CSV: {csv_path}", log_dir)
+
+    summary = {}
+    try:
+        log_message("读取数据开始", log_dir)
+        df = load_and_process_data(csv_path)
+        log_message("读取数据完成", log_dir)
+        if "Category" in df.columns:
+            cats = df["Category"].dropna().value_counts().to_dict()
+            log_message(f"Category分布: {json.dumps(cats, ensure_ascii=False)}", log_dir)
+        log_message("分析开始", log_dir)
+        results = analyze_requests(df)
+        log_message(f"分析完成 Pending={results['pending']['total_count']} Revoked={results['revoked']['total_count']}", log_dir)
+        log_message(f"[DEBUG] 即将循环遍历结果 results.keys()={list(results.keys())}", log_dir)
+        for rpt in results.values():
+            log_message(f"[DEBUG] 循环中: rpt type={rpt.get('type')}, total={rpt.get('total_count')}", log_dir)
+            send_report(rpt, reminder_dir, log_dir)
+        summary = {
+            "pending_count": int(results["pending"]["total_count"]),
+            "revoked_count": int(results["revoked"]["total_count"]),
+            "pending_review_items": results["pending"].get("items", []),
+            "revoked_items": results["revoked"].get("items", [])
+        }
+    except Exception as e:
+        log_message(f"处理异常: {e}", log_dir)
+        log_message(traceback.format_exc(), log_dir)
+        summary = {"error": str(e)}
+
+    result_path = os.path.join(base_dir, "a_results.json")
+    try:
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(make_json_safe(summary), f, ensure_ascii=False, indent=4)
+        log_message(f"结果写入: {result_path}", log_dir)
+    except Exception as e:
+        log_message(f"结果写入失败: {e}", log_dir)
+
+# ...existing code...
+    if "error" not in summary:
+        log_message(f"完成 Summary Pending={summary['pending_count']} Revoked={summary['revoked_count']}", log_dir)
+        return 0
+    else:
+        log_message(f"完成但出错: {summary['error']}", log_dir)
+        return 1
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv-path", default=None)
+    args = parser.parse_args()
+    code = main(args.csv_path)
+    sys.exit(code)
