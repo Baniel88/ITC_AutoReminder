@@ -438,6 +438,13 @@ def build_teams_markdown(report_data, subject):
 为避免权限过期影响业务正常运行，请及时处理您负责的审核任务。
 
 请通过 Chrome 浏览器（其他浏览器可能存在兼容问题）登录 [ITC 系统]({cv['ITC_SYSTEM_LINK']})，点击 **MyTasks / MyActions** 完成相关任务处理。
+
+---
+
+感谢您的及时处理！如有任何问题，请联系 Site CSL 团队支持。
+
+此致
+GC PD 网络安全团队
 """
         return intro
     else:
@@ -470,6 +477,13 @@ def build_teams_markdown(report_data, subject):
 请核查状态说明并在系统中完成权限确认与清理。
 
 [查看 ITC 系统]({cv['ITC_SYSTEM_LINK']})
+
+---
+
+感谢您的及时处理！如有任何问题，请联系 Site CSL 团队支持。
+
+此致
+GC PD 网络安全团队
 """
         return intro
 
@@ -771,7 +785,7 @@ def send_health_probe(log_dir):
     except Exception as e:
         log_message(f"健康检测异常: {e}", log_dir)
 
-SCRIPT_VERSION = "pending_report_v9_trace"
+SCRIPT_VERSION = "China PD ITC报表自动处理系统 v9"
 
 def _trace_banner():
     print(f"[TRACE] pending_review_report loaded VERSION={SCRIPT_VERSION} FILE={__file__}")
