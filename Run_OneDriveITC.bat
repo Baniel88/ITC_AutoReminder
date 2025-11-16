@@ -7,7 +7,7 @@ set python_path="C:\Users\liang.wq.1\OneDrive - Procter and Gamble\Physical Dist
 ::C:\ProgramData\miniforge3\python.exe
 ::set python_path="C:\ProgramData\miniforge3\python.exe"
 ::set python_file_path="C:\Users\liang.wq.1\Downloads\ITC_Scorecard\BatRun_ITCreport_downloader.py"
-set python_file_path="C:\Users\liang.wq.1\OneDrive - Procter and Gamble\Physical Distribution(PD)\Digital solution\ITC_AutoReminder\BatRun_ITCreport_downloader_rev1.py
+set python_file_path="C:\Users\liang.wq.1\OneDrive - Procter and Gamble\Physical Distribution(PD)\Digital solution\ITC_AutoReminder\BatRun_ITCreport_downloader_rev2.py
 
 
 :: 执行脚本并显示可能的错误信息

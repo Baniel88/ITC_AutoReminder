@@ -396,31 +396,63 @@ def build_teams_markdown(report_data, subject):
         if stats_urgent > 0:
             urgency_lines.append(f"🟠 **紧急**: {stats_urgent} 条 (建议当天处理)")
         if stats_normal > 0:
-            urgency_lines.append(f"🟢 **常规**: {stats_normal} 条 (请在过期前完成)")
+            urgency_lines.append(f"🟡 **常规**: {stats_normal} 条 (请在过期前完成)")
         
         urgency_section = "\n".join(urgency_lines) if urgency_lines else "无紧急项"
         
-        # 获取前5条明细摘要
-        detail_lines = []
+        # 构建待审核摘要表格（Markdown格式）
+        detail_lines = ["| 负责人 | 系统名称 | 分类 | 紧急程度 | 数量 |",
+                        "|-------|--------|------|--------|------|"]
+        row_count = 0
         for idx, (_, row) in enumerate(df_body.iterrows()):
             if idx >= 5:
                 remaining = len(df_body) - 5
-                detail_lines.append(f"... 还有 {remaining} 条")
+                detail_lines.append(f"| ... | ... | ... | ... | 还有 {remaining} 条 |")
                 break
             ao = row.get("Action Owner", "")
             sys = row.get("System Name", "")
             cat = row.get("Category", "")
             urgency = row.get("紧急程度", "")
             qty = row.get("Pending_review数量", "")
+            
+            # 转换紧急程度为中文表示
             if urgency == "非常紧急":
-                emoji = "🔴"
+                urgency_display = "🔴 非常紧急"
             elif urgency == "紧急":
-                emoji = "🟠"
+                urgency_display = "🟠 紧急"
             else:
-                emoji = "🟢"
-            detail_lines.append(f"{emoji} {ao} | {sys} | {cat} ({qty}条)")
+                urgency_display = "🟡 常规"
+            
+            detail_lines.append(f"| {ao} | {sys} | {cat} | {urgency_display} | {qty} |")
+            row_count += 1
         
-        details_section = "\n".join(detail_lines) if detail_lines else "无明细"
+        if row_count == 0:
+            details_section = "| 无 | 无 | 无 | 无 | 无 |"
+        else:
+            details_section = "\n".join(detail_lines)
+        
+        # 颜色规则统一逻辑
+        # 绿色: 没有常规项 (全是紧急/非常紧急)
+        # 浅黄: 有常规项
+        # 红色: 有紧急项
+        # 深红: 有非常紧急项
+        color_tag = ""
+        if stats_normal > 0:
+            color_tag = " 🟡[常规]"
+        elif stats_extreme == 0 and stats_urgent == 0:
+            color_tag = " ✅[全绿]"
+        
+        if stats_urgent > 0:
+            if color_tag:
+                color_tag += " 🔴[有紧急]"
+            else:
+                color_tag = " 🔴[有紧急]"
+        
+        if stats_extreme > 0:
+            if color_tag:
+                color_tag += " 🔴🔴[有非常紧急]"
+            else:
+                color_tag = " 🔴🔴[有非常紧急]"
         
         intro = f"""### {subject}
 
@@ -429,7 +461,8 @@ def build_teams_markdown(report_data, subject):
 **紧急程度统计：**
 {urgency_section}
 
-**待审核摘要：**
+**待审核摘要：**{color_tag}
+
 {details_section}
 
 ---
