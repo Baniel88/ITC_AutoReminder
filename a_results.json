@@ -3,14 +3,14 @@
     "revoked_count": 0,
     "pending_review_items": [
         {
-            "Action Owner": "gao.q",
-            "Action Owner Email": "gao.q@pg.com",
-            "System/Solution": "Local Digital Device-TC-PGLJ-SVRA(ASRS Server1)",
-            "Category": "TCDC",
+            "Action Owner": "zou.x.1",
+            "Action Owner Email": "zou.x.1@pg.com",
+            "System/Solution": "GBS App-XQDC-Onekey",
+            "Category": "XQDC",
             "SiteTokens": [
-                "TCDC"
+                "XQDC"
             ],
-            "剩余天数": 10,
+            "剩余天数": 14,
             "紧急程度": "常规",
             "Request ID": "N/A"
         }

@@ -385,6 +385,7 @@ def call_report_processor(csv_path):
             cmd,
             cwd=SCRIPT_DIR,
             text=True,
+            encoding='utf-8',  # 显式指定 UTF-8 编码，避免系统默认 GBK 导致解码错误
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=SCRIPT_CALL_TIMEOUT

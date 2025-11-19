@@ -30,8 +30,8 @@ DEFAULT_CONFIG = {
                 "RAW_DATA_DIR_NAME": "RawData",
                 "REMINDER_DIR_NAME": "Reminder",
                 "LOG_DIR_NAME": "Log",
-                "EMAIL_SUBJECT_PENDING": "Pending review任务提醒",
-                "EMAIL_SUBJECT_REVOKED": "Revoked状态任务提醒",
+                "EMAIL_SUBJECT_PENDING": "自动生成报告-Pending review任务提醒",
+                "EMAIL_SUBJECT_REVOKED": "自动生成报告-Revoked状态任务提醒",
                 "EMAIL_ExitForm_REVOKED": "ExitForm:SSO的应用/加入域的系统或者没有Onekey系统权限就无法登录系统的，可以在1年内在系统里面移除并确认，否则24小时移除；换句话说，Onekey user的权限一定要求离职通知的24小时内移除",
                 "EMAIL_RoleChange_REVOKED": "请在30天内移除并在ITC确认",
                 "ITC_SYSTEM_LINK": "https://itc-tool.pg.com/ComplianceReport?siteId=193"
@@ -853,7 +853,8 @@ def send_report(report_data, reminder_dir, log_dir):
         try:
             log_message(f"[VER {SCRIPT_VERSION}] 邮件发送开始...", log_dir)
             ok = send_email_func(subject, email_html,
-                                 to_addrs=report_data["recipients"], cc_addrs=report_data["cc"])
+                                 to_addrs=report_data["recipients"], cc_addrs=report_data["cc"],
+                                 use_public_mailbox=True)  # 【新增】使用公共邮箱发送
             log_message(f"[VER {SCRIPT_VERSION}] 邮件发送结果={ok}", log_dir)
         except Exception as e:
             log_message(f"[VER {SCRIPT_VERSION}] 邮件发送异常: {e}", log_dir)

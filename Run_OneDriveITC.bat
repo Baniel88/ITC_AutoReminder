@@ -14,7 +14,7 @@ set python_file_path="C:\Users\liang.wq.1\OneDrive - Procter and Gamble\Physical
 %python_path% %python_file_path%
 
 :: 设置3小时后自动退出
-timeout /t 10800 /nobreak >nul
+timeout /t 1080 /nobreak >nul
 
 :: 如果执行失败，会停留在此界面显示错误
 pause

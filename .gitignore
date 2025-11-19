@@ -67,3 +67,6 @@ $RECYCLE.BIN/
 # Personal/Sensitive Config (包含真实邮箱和Teams webhook)
 email_config.json
 teams_config.json
+
+# Test files folder
+Test/

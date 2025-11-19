@@ -164,6 +164,7 @@ def send_email(subject, html_content, to_addrs, cc_addrs=None,
     max_retries: 发送确认扫描失败时的重试次数
     kwargs 支持:
         attachments = [filepath1, filepath2]
+        use_public_mailbox = True (默认使用公共邮箱 ChinaPD_Cybersecurity_Robot)
     返回 True/False
     """
     cfg = load_email_config(config_path)
@@ -182,6 +183,7 @@ def send_email(subject, html_content, to_addrs, cc_addrs=None,
     trim = bool(scfg.get("EMAIL_TRIM_EMPTY", True))
 
     attachments = kwargs.get("attachments")  # list or None
+    use_public_mailbox = kwargs.get("use_public_mailbox", True)  # 默认使用公共邮箱
 
     if cc_addrs is None:
         cc_addrs = []
@@ -200,119 +202,62 @@ def send_email(subject, html_content, to_addrs, cc_addrs=None,
         log("win32com / pythoncom 不可用，无法使用本地 Outlook 发送。")
         return False
 
-    attempt_send_time = None
-    sent_success = False
-
-    # 发送尝试 + 可选验证
-    for attempt in range(1, max_retries + 2):  # 尝试次数 = max_retries + 初始一次
+        # ========== COM 初始化 ==========
+    pythoncom.CoInitialize()
+    
+    try:
+        # 【简化版】直接使用公共邮箱发送，不要回退到个人账户
+        from public_mailbox_sender import PublicMailboxAutoSender
+        
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        
+        # 简单的 logger 适配器
+        class SimpleLogger:
+            def info(self, msg):
+                log(msg)
+            def error(self, msg):
+                log(f"❌ {msg}")
+            def warning(self, msg):
+                log(f"⚠️  {msg}")
+            def debug(self, msg):
+                log(f"🔍 {msg}")
+        
+        sender = PublicMailboxAutoSender(outlook, SimpleLogger())
+        log(f"✅ 使用公共邮箱发送: ChinaPD_Cybersecurity_Robot")
+        log(f"   收件人: {to_addrs}")
+        
+        success = sender.send_from_public_mailbox(
+            mailbox_name="ChinaPD_Cybersecurity_Robot",
+            to_addresses=to_addrs,
+            cc_addresses=cc_addrs,
+            subject=final_subject,
+            html_body=html_content or "",
+            attachments=attachments,
+            save_draft_only=False
+        )
+        
+        if success:
+            log("✅ 邮件已成功通过公共邮箱发送！")
+            return True
+        else:
+            log("❌ 公共邮箱发送失败")
+            return False
+    
+    except Exception as e:
+        log(f"❌ 错误: {type(e).__name__}: {e}")
+        log(traceback.format_exc())
+        return False
+    
+    finally:
+        # ========== COM 反初始化 ==========
         try:
-            pythoncom.CoInitialize()
-            outlook = win32com.client.Dispatch("Outlook.Application")
-            ns = outlook.GetNamespace("MAPI")
-            accounts = outlook.Session.Accounts
-            try:
-                acct = accounts.Item(1)
-                log(f"使用账户: {acct.SmtpAddress} (尝试 {attempt}/{max_retries + 1})")
-            except Exception:
-                log(f"无法获取当前账户 (尝试 {attempt}/{max_retries + 1})")
-
-            mail = outlook.CreateItem(0)
-            mail.Subject = final_subject
-            body = html_content or ""
-            if append_sig and signature_html and signature_html not in body:
-                body += ("\n" + signature_html)
-            mail.HTMLBody = body
-            mail.To = ";".join(to_addrs)
-            if cc_addrs:
-                mail.CC = ";".join(cc_addrs)
-
-            if attachments:
-                _attach_files(mail, attachments)
-
-            mail.Save()
-            log(f"邮件草稿已保存: To={len(to_addrs)} Cc={len(cc_addrs)} Attachments={len(attachments or [])}")
-
-            attempt_send_time = datetime.now()
-            mail.Send()
-            log("邮件已提交发送 (Outlook.Send)")
-
-            if not verify_sent:
-                log("EMAIL_VERIFY_SENT=False 跳过已发送确认，直接返回成功。")
-                sent_success = True
-                break
-
-            # 验证阶段
-            log(f"开始验证发送成功，最大等待 {max_wait}s")
-            time.sleep(3)  # 初始等待
-            timeout_ts = time.time() + max_wait
-            found_item = None
-
-            sent_folder = ns.GetDefaultFolder(5)  # 已发送邮件
-            sent_items = sent_folder.Items
-            sent_items.Sort("[SentOn]", True)
-
-            while time.time() < timeout_ts and found_item is None:
-                found_item = _find_sent_item(sent_items, final_subject, attempt_send_time, lookback_seconds=max_wait + 5)
-                if found_item:
-                    log(f"确认发送成功: SentOn={found_item.SentOn.strftime('%Y-%m-%d %H:%M:%S')}")
-                    sent_success = True
-                    break
-                time.sleep(3)
-
-            if sent_success:
-                break
-            else:
-                log(f"尝试 {attempt} 未确认发送成功。")
-                if attempt <= max_retries:
-                    log(f"等待 {interval}s 后重试发送。")
-                    time.sleep(interval)
-                else:
-                    log("达到最大重试次数，退出发送循环。")
-
+            pythoncom.CoUninitialize()
         except Exception as e:
-            log(f"尝试 {attempt} 异常: {e}")
-            log(traceback.format_exc())
-            if attempt <= max_retries:
-                log(f"等待 {interval}s 后重试 (异常后)。")
-                time.sleep(interval)
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
-        if sent_success:
-            break
-
-    if sent_success:
-        return True
-
-    # 发送失败处理: 保存草稿
-    if draft_on_fail:
-        try:
-            pythoncom.CoInitialize()
-            outlook = win32com.client.Dispatch("Outlook.Application")
-            mail = outlook.CreateItem(0)
-            mail.Subject = final_subject
-            mail.HTMLBody = html_content or ""
-            mail.To = ";".join(to_addrs)
-            if cc_addrs:
-                mail.CC = ";".join(cc_addrs)
-            if attachments:
-                _attach_files(mail, attachments)
-            mail.Save()
-            log("发送失败，已保存到草稿箱供人工检查。")
-        except Exception as e:
-            log(f"发送失败后保存草稿再次异常: {e}")
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            log(f"COM反初始化异常: {e}")
 
     return False
 
-# ---------------- 简单自测 ----------------
+# 简单自测
 if __name__ == "__main__":
     test_html = "<html><body><h3>测试邮件</h3><p>这是一封测试。</p></body></html>"
     ok = send_email(

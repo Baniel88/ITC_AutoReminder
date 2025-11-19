@@ -1,6 +1,7 @@
 {
   "reports": {
     "Pending review任务提醒": {
+      "From": ["ChinaPD_Cybersecurity_Robot"],
       "recipients": [],
       "cc": ["liang.wq.1@pg.com"],
       "cc1": {
@@ -17,6 +18,7 @@
       }
     },
     "Revoked状态任务提醒": {
+      "From": ["ChinaPD_Cybersecurity_Robot"],
       "recipients": [],
       "cc": ["liang.wq.1@pg.com"],
       "cc1": {
@@ -41,7 +43,7 @@
     "SHARED_SENDER_EMAIL": "ChinaPD_CyberSecurity@shared.pg.com",
     "SHARED_SENDER_NAME": "ITC 自动提醒系统",
     "TEAMS_ENABLED": true,
-    "MAX_REMAINING_DAYS_FOR_REPORT": 10,
+    "MAX_REMAINING_DAYS_FOR_REPORT": 19,
     "URGENCY_LEVELS": {
       "非常紧急": 2,
       "紧急": 4,
